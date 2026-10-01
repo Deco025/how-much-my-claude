@@ -1,0 +1,4 @@
+data/
+prices_override.json
+__pycache__/
+*.pyc
