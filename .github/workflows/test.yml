@@ -1,0 +1,31 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # 测试只用到后端；桌面窗口和托盘的依赖（pywebview、pystray）在 CI 里不装
+      - run: pip install "fastapi>=0.110" "uvicorn>=0.29" "numpy>=1.24" Pillow httpx
+      - run: python -m unittest discover tests -v
+      - name: page scripts parse
+        run: |
+          node --check quotalens/web/app.js
+          node --check quotalens/web/i18n.js
+      - name: every page string has an English version
+        shell: bash
+        run: |
+          missing="$(python tools/i18n_keys.py)"
+          if [ -n "$missing" ]; then echo "$missing"; exit 1; fi
