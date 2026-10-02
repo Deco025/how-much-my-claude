@@ -24,8 +24,6 @@ jobs:
         run: |
           node --check quotalens/web/app.js
           node --check quotalens/web/i18n.js
-          node --check quotalens/web/mascot.js
-          node --check quotalens/web/story.js
       - name: every page string has an English version
         shell: bash
         run: |

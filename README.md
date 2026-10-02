@@ -24,7 +24,7 @@
 </picture>
 </p>
 
-<p align="center"><sub>同样的工作量，第二个 5 小时窗口却提前用满：「已花 $28.6 / 约值 $40.9」对不上，工具判为疑似收紧。<br>动画里的数据是虚构的，卡片用的是真实界面的渲染和算法；打开本地页面加上 <code>/?story</code> 就能看实时播放。</sub></p>
+<p align="center"><sub>同样的工作量，第二个 5 小时窗口却提前用满：「已花 $28.6 / 约值 $40.9」对不上，工具判为疑似收紧。<br>动画里的数据是虚构的。</sub></p>
 
 ## 它能告诉你什么
 
@@ -199,7 +199,6 @@ python -m unittest discover tests
 
 - 页面文字加了新的中文后，运行 `python tools/i18n_keys.py`，它会列出 `quotalens/web/i18n.js` 里还缺英文的条目。
 - 应用图标是代码画的：`python tools/make_icon.py`。
-- README 顶部的动画：剧情在 `quotalens/web/story.js`，吉祥物在 `mascot.js`；改完运行 `python tools/record_story.py --lang zh --scheme light`（中英文、深浅色各录一份，需要 Playwright 和 ffmpeg）。
 
 ```
 quotalens/
@@ -220,9 +219,9 @@ quotalens/
   install.py         快捷方式与开机自启（Windows / macOS / Linux）
   notify.py          系统通知（Windows / macOS / Linux）
   i18n.py            托盘、通知等后端文字的英文
-  web/               页面（ECharts 已打包在 vendor/；story.js + mascot.js 是 README 里那段动画）
+  web/               页面（ECharts 已打包在 vendor/）
 desktop.pyw / run.py / install.py   从源码运行时的入口
-tools/               图标生成、翻译检查、录 README 动画
+tools/               图标生成、翻译检查
 docs/images/         README 截图（演示模式下截的）
 ```
 

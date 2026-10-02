@@ -8,3 +8,5 @@ tools/icon_preview.png
 build/
 dist/
 .venv/
+# README 动画的源码和录制工具，只留在本地
+promo/

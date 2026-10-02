@@ -24,7 +24,7 @@ Turns your Codex CLI and Claude Code subscription usage into API-equivalent doll
 </picture>
 </p>
 
-<p align="center"><sub>Same amount of work, but the second 5-hour window runs out early: "Spent $28.6 / worth ~$40.9" doesn't add up, so the tool flags it as possibly tightened.<br>The numbers are made up; the card uses the real UI's rendering and math. Open the local page with <code>/?story</code> to watch it live.</sub></p>
+<p align="center"><sub>Same amount of work, but the second 5-hour window runs out early: "Spent $28.6 / worth ~$40.9" doesn't add up, so the tool flags it as possibly tightened.<br>The numbers are made up.</sub></p>
 
 ## What it tells you
 
@@ -177,7 +177,7 @@ pip install -r requirements.txt httpx
 python -m unittest discover tests
 ```
 
-After adding Chinese UI text, run `python tools/i18n_keys.py` to list entries still missing from `quotalens/web/i18n.js`. The app icon is drawn in code: `python tools/make_icon.py`. The README animation lives in `quotalens/web/story.js` (the mascot in `mascot.js`); re-record it with `python tools/record_story.py --lang en --scheme light` (once per language and color scheme; needs Playwright and ffmpeg).
+After adding Chinese UI text, run `python tools/i18n_keys.py` to list entries still missing from `quotalens/web/i18n.js`. The app icon is drawn in code: `python tools/make_icon.py`.
 
 ## License
 
