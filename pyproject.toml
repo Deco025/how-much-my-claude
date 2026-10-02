@@ -23,7 +23,7 @@ dependencies = [
 test = ["httpx"]
 
 [project.urls]
-Homepage = "https://github.com/Deco025/quota-lens"
+Homepage = "https://github.com/Deco025/how-much-my-claude"
 
 # 桌面版用图形入口：Windows 上启动时不弹命令行窗口
 [project.gui-scripts]

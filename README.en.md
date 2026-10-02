@@ -8,7 +8,7 @@
 
 Turns your Codex CLI and Claude Code subscription usage into API-equivalent dollars,<br>works out what each 5-hour and weekly window is worth, and watches for silent quota changes.
 
-[![test](https://github.com/Deco025/quota-lens/actions/workflows/test.yml/badge.svg)](https://github.com/Deco025/quota-lens/actions/workflows/test.yml)
+[![test](https://github.com/Deco025/how-much-my-claude/actions/workflows/test.yml/badge.svg)](https://github.com/Deco025/how-much-my-claude/actions/workflows/test.yml)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776ab)
 ![Windows | macOS | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f)](LICENSE)
@@ -56,7 +56,7 @@ Requires Python 3.10 or newer.
 **With pipx (recommended):**
 
 ```bash
-pipx install git+https://github.com/Deco025/quota-lens.git
+pipx install git+https://github.com/Deco025/how-much-my-claude.git
 ```
 
 ```bash
@@ -68,11 +68,11 @@ The second command creates a launcher: on the Desktop on Windows, in `~/Applicat
 **From source:**
 
 ```bash
-git clone https://github.com/Deco025/quota-lens.git
+git clone https://github.com/Deco025/how-much-my-claude.git
 ```
 
 ```bash
-cd quota-lens && pip install -r requirements.txt
+cd how-much-my-claude && pip install -r requirements.txt
 ```
 
 ```bash

@@ -8,7 +8,7 @@
 
 把 Codex CLI、Claude Code 的订阅用量按官方 API 价折算成美元，<br>算出每个 5 小时、每周窗口值多少钱，并盯着厂商有没有暗调额度。
 
-[![test](https://github.com/Deco025/quota-lens/actions/workflows/test.yml/badge.svg)](https://github.com/Deco025/quota-lens/actions/workflows/test.yml)
+[![test](https://github.com/Deco025/how-much-my-claude/actions/workflows/test.yml/badge.svg)](https://github.com/Deco025/how-much-my-claude/actions/workflows/test.yml)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776ab)
 ![Windows | macOS | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f)](LICENSE)
@@ -56,7 +56,7 @@ how-much-my-claude-server --demo --open
 **推荐用 pipx**（装在独立环境里，命令随处可用）：
 
 ```bash
-pipx install git+https://github.com/Deco025/quota-lens.git
+pipx install git+https://github.com/Deco025/how-much-my-claude.git
 ```
 
 ```bash
@@ -68,11 +68,11 @@ how-much-my-claude-install
 **从源码运行**：
 
 ```bash
-git clone https://github.com/Deco025/quota-lens.git
+git clone https://github.com/Deco025/how-much-my-claude.git
 ```
 
 ```bash
-cd quota-lens && pip install -r requirements.txt
+cd how-much-my-claude && pip install -r requirements.txt
 ```
 
 ```bash

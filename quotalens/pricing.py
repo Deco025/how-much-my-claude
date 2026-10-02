@@ -158,7 +158,7 @@ class PriceTable:
 
 def refresh_from_models_dev(timeout=30) -> int:
     """拉取 models.dev 写入缓存，返回模型数。网络失败抛异常，由调用方记录。"""
-    req = urllib.request.Request(MODELS_DEV_URL, headers={"User-Agent": "quota-lens"})
+    req = urllib.request.Request(MODELS_DEV_URL, headers={"User-Agent": "how-much-my-claude"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = json.loads(resp.read())
     models = extract_models_dev(raw)

@@ -110,7 +110,7 @@ def poll(timeout=15) -> dict:
         "Authorization": f"Bearer {token}",
         "anthropic-beta": "oauth-2025-04-20",
         "Accept": "application/json",
-        "User-Agent": "quota-lens",
+        "User-Agent": "how-much-my-claude",
     })
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
