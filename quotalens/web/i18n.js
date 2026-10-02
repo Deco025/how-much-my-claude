@@ -76,6 +76,7 @@ const EN = {
   "较之前 {pct}": "{pct} vs before",
   "全用 {model} 时一个窗口约值": "One window is worth about this much if spent all on {model}",
   "（最近 {n} 个窗口中位）": " (median of the last {n} windows)",
+  "（最近 1 个窗口）": " (latest window)",
   "已记录 {n} 个窗口，攒到 2 个用量 5% 以上的窗口后开始判断": "{n} windows recorded; judging starts once 2 windows reach 5% usage",
   "还没有足够的窗口数据。": "Not enough window data yet.",
   "按 API 等价金额粗看，一个窗口之前约 {before}、现在约 {after}（{pct}），仅供参考。":

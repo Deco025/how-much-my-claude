@@ -265,8 +265,8 @@ function renderBanner(monitor) {
 
 // ── 现在：各窗口进度 ─────────────────────────────────────
 
-function renderWindowRow(w) {
-  const tNow = now();
+// tNow 默认是现在；剧情动画（story.js）传入它自己的时钟
+function renderWindowRow(w, tNow = now()) {
   const label = h("span", { class: "win-label" }, windowLabel(w));
   if (!w.active) {
     return h("div", { class: "win idle" },
@@ -361,7 +361,7 @@ function renderMonitor(monitor) {
             ? h("span", { class: deltaClass }, t("较之前 {pct}", { pct: pctText(g.ratio - 1) }))
             : null),
         h("div", { class: "caption" }, t("全用 {model} 时一个窗口约值", { model: g.ref_model }) +
-          (g.recent_median != null ? t("（最近 {n} 个窗口中位）", { n: g.recent_n }) : "")));
+          (g.recent_median == null ? "" : g.recent_n === 1 ? t("（最近 1 个窗口）") : t("（最近 {n} 个窗口中位）", { n: g.recent_n }))));
     }
     card.append(deviationGauge(g, status));
     const note = monitorNote(g, status);
@@ -1124,5 +1124,13 @@ $("#logo-toggle").addEventListener("click", () => {
 window.addEventListener("resize", () => charts.forEach((c) => c.resize()));
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => loadAll());
 
-init().catch((e) => $("#now").replaceChildren(h("p", { class: "empty" }, t("加载失败：") + e.message)));
-const refreshTimer = setInterval(() => loadAll().catch(() => {}), 60_000);
+// 地址带 ?story 时是宣传动画：吉祥物在进度条上敲代码，只演一张虚构的 Claude 卡片，不请求任何接口（见 story.js）
+const STORY = new URLSearchParams(location.search).has("story");
+if (STORY) {
+  for (const src of ["mascot.js", "story.js"]) {
+    document.body.append(Object.assign(document.createElement("script"), { src, async: false }));
+  }
+} else {
+  init().catch((e) => $("#now").replaceChildren(h("p", { class: "empty" }, t("加载失败：") + e.message)));
+}
+const refreshTimer = STORY ? null : setInterval(() => loadAll().catch(() => {}), 60_000);

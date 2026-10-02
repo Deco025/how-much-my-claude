@@ -3,7 +3,7 @@
   python tools/i18n_keys.py         列出缺英文的中文原文（没有输出就是齐了）
   python tools/i18n_keys.py --all   列出全部中文原文
 
-扫的是 app.js 里所有带中文的字符串字面量（含模板字符串 ${} 里的），和 index.html 的 data-i18n* 属性。
+扫的是 app.js、story.js 里所有带中文的字符串字面量（含模板字符串 ${} 里的），和 index.html 的 data-i18n* 属性。
 """
 import re
 import sys
@@ -90,10 +90,11 @@ def _regex_allowed(src, i):
 
 def keys():
     found = []
-    for s in js_strings((WEB / "app.js").read_text(encoding="utf-8")):
-        s = s.replace("\\n", "\n")
-        if CJK.search(s) and "${}" not in s and s not in found:
-            found.append(s)
+    for name in ("app.js", "story.js"):
+        for s in js_strings((WEB / name).read_text(encoding="utf-8")):
+            s = s.replace("\\n", "\n")
+            if CJK.search(s) and "${}" not in s and s not in found:
+                found.append(s)
     html = (WEB / "index.html").read_text(encoding="utf-8")
     for m in re.finditer(r'data-i18n(?:-tip|-aria|-title|-placeholder)?="([^"]*)"', html):
         if m.group(1) not in found:

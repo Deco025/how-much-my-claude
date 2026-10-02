@@ -17,12 +17,14 @@
 
 </div>
 
+<p align="center">
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-zh-dark.png">
-  <img alt="How much my Claude 界面：Codex 的 5 小时额度被标为疑似收紧" src="docs/images/hero-zh-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/story-zh-dark.gif">
+  <img alt="动画：吉祥物敲代码用满 5 小时额度，休息后写小说，同样的工作量却提前用满，工具判为疑似收紧" src="docs/images/story-zh-light.gif" width="584">
 </picture>
+</p>
 
-<p align="center"><sub>截图是演示模式里的虚构数据：最近 3 天 Codex 的 5 小时额度被悄悄收紧，工具标了出来。自己跑一下：<code>how-much-my-claude-server --demo --open</code></sub></p>
+<p align="center"><sub>同样的工作量，第二个 5 小时窗口却提前用满：「已花 $28.6 / 约值 $40.9」对不上，工具判为疑似收紧。<br>动画里的数据是虚构的，卡片用的是真实界面的渲染和算法；打开本地页面加上 <code>/?story</code> 就能看实时播放。</sub></p>
 
 ## 它能告诉你什么
 
@@ -31,6 +33,13 @@
 - **还够不够用**：像素格进度条同时画出已用、照这个速度到重置会用到哪、窗口时间走到哪；预计提前用完会标红。
 - **不被干扰带偏**：自动识别别的设备、网页聊天这类本地看不到的消耗；停用一段时间再回来会跨断档对比；换了主力模型会如实说「这次没法比」。
 - **完全本地**：只读本机日志，不单独登录、不上传数据、没有统计上报。数据永久保存，要留要删你说了算。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-zh-dark.png">
+  <img alt="How much my Claude 界面：Codex 的 5 小时额度被标为疑似收紧" src="docs/images/hero-zh-light.png">
+</picture>
+
+<p align="center"><sub>完整界面（演示模式里的虚构数据：最近 3 天 Codex 的 5 小时额度被悄悄收紧）。自己跑一下：<code>how-much-my-claude-server --demo --open</code></sub></p>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/more-zh-dark.png">
@@ -190,6 +199,7 @@ python -m unittest discover tests
 
 - 页面文字加了新的中文后，运行 `python tools/i18n_keys.py`，它会列出 `quotalens/web/i18n.js` 里还缺英文的条目。
 - 应用图标是代码画的：`python tools/make_icon.py`。
+- README 顶部的动画：剧情在 `quotalens/web/story.js`，吉祥物在 `mascot.js`；改完运行 `python tools/record_story.py --lang zh --scheme light`（中英文、深浅色各录一份，需要 Playwright 和 ffmpeg）。
 
 ```
 quotalens/
@@ -210,9 +220,9 @@ quotalens/
   install.py         快捷方式与开机自启（Windows / macOS / Linux）
   notify.py          系统通知（Windows / macOS / Linux）
   i18n.py            托盘、通知等后端文字的英文
-  web/               页面（ECharts 已打包在 vendor/）
+  web/               页面（ECharts 已打包在 vendor/；story.js + mascot.js 是 README 里那段动画）
 desktop.pyw / run.py / install.py   从源码运行时的入口
-tools/               图标生成、翻译检查
+tools/               图标生成、翻译检查、录 README 动画
 docs/images/         README 截图（演示模式下截的）
 ```
 

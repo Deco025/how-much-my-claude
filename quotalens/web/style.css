@@ -535,3 +535,20 @@ code { font-family: var(--mono); font-size: 12px; word-break: break-all; }
 .settings input[type="number"], .settings select { font: inherit; font-size: 13px; padding: 3px 8px; width: 110px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-1); color: var(--text-primary); }
 .settings input[type="checkbox"] { width: 16px; height: 16px; }
 .settings-actions { display: flex; gap: 12px; align-items: center; }
+
+/* ── 宣传动画（地址带 ?story，见 story.js）：只留告警横幅和一张 Claude 卡片 ── */
+body.story .corner-logos, body.story .logo-toggle, body.story .topbar, body.story #connect,
+body.story main > section:not(:first-of-type), body.story main h2 { display: none; }
+body.story main { max-width: 600px; padding: 8px 24px 32px; }
+body.story main > section { margin-top: 16px; }
+body.story #alert-banner { opacity: 0; }
+body.story #now { display: block; }
+.story-card { position: relative; }
+/* 标题里的小图标就是吉祥物的「家」：放大到和吉祥物一样大，本身藏起来，由吉祥物那一层来画 */
+.story-card .card-head .sprite { width: 64px; height: 40px; visibility: hidden; }
+/* 进度条上方留出吉祥物站着、头上冒问号、沙滩椅靠背的高度 */
+.story-card .win { padding-top: 70px; }
+.story-card .win:first-of-type { padding-top: 64px; }
+.story-card .mascot { position: absolute; z-index: 3; pointer-events: none; overflow: visible; }
+.story-stamp { position: absolute; top: 12px; right: 78px; z-index: 2; font-size: 15px; opacity: 0; }
+.fact.story-flag { outline: 2px dashed var(--critical); outline-offset: 4px; border-radius: 4px; }

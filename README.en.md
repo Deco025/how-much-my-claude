@@ -17,12 +17,14 @@ Turns your Codex CLI and Claude Code subscription usage into API-equivalent doll
 
 </div>
 
+<p align="center">
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-en-dark.png">
-  <img alt="How much my Claude: Codex's 5-hour quota flagged as possibly tightened" src="docs/images/hero-en-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/story-en-dark.gif">
+  <img alt="Animation: the mascot codes until the 5-hour quota is used up, rests, then writes a novel; the same amount of work runs out early and the tool flags a possible tightening" src="docs/images/story-en-light.gif" width="584">
 </picture>
+</p>
 
-<p align="center"><sub>The screenshot uses made-up demo data: Codex's 5-hour quota was quietly tightened 3 days ago, and the tool caught it. Try it: <code>how-much-my-claude-server --demo --open</code></sub></p>
+<p align="center"><sub>Same amount of work, but the second 5-hour window runs out early: "Spent $28.6 / worth ~$40.9" doesn't add up, so the tool flags it as possibly tightened.<br>The numbers are made up; the card uses the real UI's rendering and math. Open the local page with <code>/?story</code> to watch it live.</sub></p>
 
 ## What it tells you
 
@@ -31,6 +33,13 @@ Turns your Codex CLI and Claude Code subscription usage into API-equivalent doll
 - **Whether it will last**: a pixel progress bar shows what you've used, where you'll be at reset at the current pace, and how much of the window's time has passed; running out early turns it red.
 - **Not fooled by noise**: usage your local logs can't see (other devices, web chat) is detected and removed; coming back after a break compares across the gap; switching main models is reported honestly as "can't compare yet".
 - **Fully local**: it only reads local logs — no separate sign-in, no uploads, no telemetry. Data is kept forever, and you decide what to keep or delete.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-en-dark.png">
+  <img alt="How much my Claude: Codex's 5-hour quota flagged as possibly tightened" src="docs/images/hero-en-light.png">
+</picture>
+
+<p align="center"><sub>The full UI (made-up demo data: Codex's 5-hour quota was quietly tightened 3 days ago). Try it: <code>how-much-my-claude-server --demo --open</code></sub></p>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/more-en-dark.png">
@@ -168,7 +177,7 @@ pip install -r requirements.txt httpx
 python -m unittest discover tests
 ```
 
-After adding Chinese UI text, run `python tools/i18n_keys.py` to list entries still missing from `quotalens/web/i18n.js`. The app icon is drawn in code: `python tools/make_icon.py`.
+After adding Chinese UI text, run `python tools/i18n_keys.py` to list entries still missing from `quotalens/web/i18n.js`. The app icon is drawn in code: `python tools/make_icon.py`. The README animation lives in `quotalens/web/story.js` (the mascot in `mascot.js`); re-record it with `python tools/record_story.py --lang en --scheme light` (once per language and color scheme; needs Playwright and ffmpeg).
 
 ## License
 
