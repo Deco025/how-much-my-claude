@@ -1,31 +1,39 @@
 """HTTP 接口 + 静态页面。只监听 127.0.0.1。"""
+import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import calibrate, claude_quota, db, stats
-from .paths import PROJECT_ROOT
+from . import calibrate, claude_quota, codex_quota, collect_claude, collect_codex, db, paths, pricing, settings, stats
+from .paths import WEB_DIR
 from .service import Service
 
-WEB_DIR = PROJECT_ROOT / "web"
 TOOLS = ("codex", "claude")
 RELIABLE_RATE_WINDOWS = 4  # 模型至少出现在这么多窗口里，汇率才算可靠
 LOCAL_HOSTS = ["127.0.0.1", "localhost"]
 
 
-def create_app(service: Service) -> FastAPI:
+def _exit_process():
+    os._exit(0)
+
+
+def create_app(service: Service, on_show=None, on_quit=None) -> FastAPI:
+    """on_show / on_quit 由桌面版传入（把窗口调到前面 / 退出整个程序）；浏览器版不传。"""
+    quit_app = on_quit or _exit_process
+
     @asynccontextmanager
     async def lifespan(_app):
         service.start()
         yield
         service.stop()
 
-    app = FastAPI(title="quota-lens", lifespan=lifespan)
+    app = FastAPI(title="How much my Claude", lifespan=lifespan)
     # 只认本机域名：挡住 DNS 重绑定（外部网页把自己的域名解析到 127.0.0.1 来读数据）
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=LOCAL_HOSTS)
 
@@ -109,18 +117,123 @@ def create_app(service: Service) -> FastAPI:
 
     @app.get("/api/prices")
     def prices():
+        """models：用过的模型和它们查到的价格；catalog：价格表里的全部模型（美元 / 百万 token）。"""
         rows = []
         with db.reader() as conn:
             for r in conn.execute("SELECT tool, model, on_plan, COUNT(*) AS requests, MAX(ts) AS last_used "
                                   "FROM usage GROUP BY tool, model, on_plan ORDER BY last_used DESC"):
                 key, price = service.prices.find(r["model"])
                 rows.append({**dict(r), "price_key": key, "price": price})
-        return {"fetched_at": service.prices.fetched_at, "models": rows}
+        table = service.prices
+        catalog = [{"model": name, "source": table.sources.get(name), "alias_of": p.get("alias_of"),
+                    **{k: p.get(k) for k in pricing.PRICE_KEYS},
+                    "tiers": p.get("tiers") or [], "fast": p.get("fast")}
+                   for name, p in sorted(table.models.items())]
+        return {"fetched_at": table.fetched_at, "models": rows, "catalog": catalog,
+                "override_path": str(pricing.PRICE_OVERRIDE_PATH)}
+
+    # ── 设置、连接状态 ──────────────────────────────────
+
+    @app.get("/api/settings")
+    def get_settings():
+        return {"values": service.settings, "defaults": settings.DEFAULTS, "limits": settings.LIMITS,
+                "data_dir": str(db.DATA_DIR)}
+
+    @app.post("/api/settings")
+    def post_settings(changes: dict = Body(...)):
+        return {"values": service.update_settings(changes)}
+
+    @app.get("/api/connections")
+    def connections():
+        """两个工具各自：本机有没有它的日志、登录信息找不找得到、最近一次查额度的结果。不含 token。"""
+        out = []
+        for tool, mod, quota in (("codex", collect_codex, codex_quota), ("claude", collect_claude, claude_quota)):
+            files = mod.log_files()
+            out.append({"tool": tool, "log_dir": str(paths.codex_dir() if tool == "codex" else paths.claude_dir()),
+                        "log_files": len(files), "credentials": quota.read_credentials()[-1],
+                        "credentials_where": quota.credentials_location(),
+                        "last_poll": service.status.get(f"{tool}_quota")})
+        return out
+
+    # ── 数据管理 ────────────────────────────────────────
+
+    @app.get("/api/data")
+    def data_overview():
+        """存了什么、按订阅方案分组，以及本机还有多少日志没导入。"""
+        analysis = service.analysis()
+        groups, logs = [], {}
+        with db.reader() as conn:
+            imported = {r[0] for r in conn.execute("SELECT path FROM file_cursor")}
+            for tool, mod in (("codex", collect_codex), ("claude", collect_claude)):
+                rules = db.data_rules(conn, tool)
+                by_plan = {}
+                for w in analysis["tools"][tool]["windows"]:
+                    by_plan.setdefault(w["plan_type"], []).append(w)
+                for plan, ws in by_plan.items():
+                    groups.append({"tool": tool, "plan": plan, "first": min(w["start"] for w in ws),
+                                   "last": max(w["last_seen"] for w in ws), "windows": len(ws),
+                                   "ignored_windows": sum(w["excluded"] for w in ws),
+                                   "mode": rules["plans"].get(plan, ("keep",))[0]})
+                for plan, (mode, until) in rules["plans"].items():
+                    if mode == "deleted" and plan not in by_plan:
+                        groups.append({"tool": tool, "plan": plan, "mode": "deleted", "deleted_at": until})
+                usage = conn.execute("SELECT COUNT(*) AS n, MIN(ts) AS first, MAX(ts) AS last FROM usage WHERE tool = ?",
+                                     (tool,)).fetchone()
+                files = mod.log_files()
+                pending = [f for f in files if str(f) not in imported]
+                logs[tool] = {"requests": usage["n"], "first": usage["first"], "last": usage["last"],
+                              "files": len(files), "pending": len(pending),
+                              "pending_oldest": min((f.stat().st_mtime for f in pending), default=None)}
+        backups = sorted((db.DATA_DIR / "backups").glob("*.db")) if (db.DATA_DIR / "backups").is_dir() else []
+        return {"db_bytes": db.DB_PATH.stat().st_size if db.DB_PATH.exists() else 0, "data_dir": str(db.DATA_DIR),
+                "backups": {"daily": sum(b.name.startswith("quotalens-") for b in backups),
+                            "before_delete": sum(b.name.startswith("before-delete-") for b in backups)},
+                "groups": groups, "logs": logs}
+
+    def _check_tool(tool):
+        if tool not in TOOLS:
+            raise HTTPException(400, "未知工具")
+
+    @app.post("/api/data/rule")
+    def data_rule(tool: str = Body(...), kind: str = Body(...), target: str = Body(...), ignore: bool = Body(...)):
+        """某个订阅方案 / 窗口：不参与分析（ignore=true）或恢复。数据本身不动。"""
+        _check_tool(tool)
+        if kind not in ("plan", "window"):
+            raise HTTPException(400, "kind 只能是 plan / window")
+        service.set_rule(tool, kind, target, "ignore" if ignore else None)
+        return {"ok": True}
+
+    @app.post("/api/data/delete")
+    def data_delete(tool: str = Body(...), plan: str = Body(...)):
+        _check_tool(tool)
+        return service.delete_plan(tool, plan)
+
+    @app.post("/api/data/import-history")
+    def data_import_history():
+        return service.import_history()
 
     @app.post("/api/sync")
     def sync():
         service.sync_now()
         return service.status
+
+    @app.post("/api/shutdown")
+    def shutdown():
+        """退出程序（页面上的「停止服务」用）。
+
+        数据库写入都在事务里，直接退出进程不会损坏数据；先回复再退出，调用方能拿到结果。
+        """
+        service.stop()
+        threading.Timer(0.5, quit_app).start()
+        return {"ok": True}
+
+    @app.post("/api/show")
+    def show():
+        """桌面版已在运行时，再次双击图标会调这个接口，把现有窗口调到前面。"""
+        if on_show is None:
+            raise HTTPException(404, "不是桌面版，没有窗口")
+        on_show()
+        return {"ok": True}
 
     @app.get("/")
     def index():

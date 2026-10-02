@@ -13,9 +13,13 @@ SOURCE_NAMES = {"log": "日志", "api": "额度接口"}
 TOOL_NAMES = {"codex": "Codex", "claude": "Claude"}
 
 
-def _event(ts, tool, kind, title, detail="", window=None):
-    """window 为空表示影响整个工具（方案、字段变化），否则只关乎该窗口类型。"""
-    return {"ts": ts, "tool": tool, "kind": kind, "title": title, "detail": detail, "window": window}
+def _event(ts, tool, kind, title, detail="", window=None, params=None):
+    """window 为空表示影响整个工具（方案、字段变化），否则只关乎该窗口类型。
+
+    title / detail 是中文说明；params 是同一件事的原始数据，页面切到英文时用它重新组句。
+    """
+    return {"ts": ts, "tool": tool, "kind": kind, "title": title, "detail": detail, "window": window,
+            "params": params or {}}
 
 
 def _schema_events(conn):
@@ -39,11 +43,13 @@ def _schema_events(conn):
                 removed.setdefault(round(b / 3600), []).append((b, path))
         where = f"{TOOL_NAMES[tool]}{SOURCE_NAMES.get(source, source)}"
         for items in added.values():
-            out.append(_event(min(a for a, _ in items), tool, "schema", f"{where}出现新字段",
-                              "、".join(sorted(p for _, p in items))))
+            fields = sorted(p for _, p in items)
+            out.append(_event(min(a for a, _ in items), tool, "schema", f"{where}出现新字段", "、".join(fields),
+                              params={"change": "added", "source": source, "fields": fields}))
         for items in removed.values():
-            out.append(_event(max(b for b, _ in items), tool, "schema", f"{where}的字段不再出现",
-                              "、".join(sorted(p for _, p in items))))
+            fields = sorted(p for _, p in items)
+            out.append(_event(max(b for b, _ in items), tool, "schema", f"{where}的字段不再出现", "、".join(fields),
+                              params={"change": "removed", "source": source, "fields": fields}))
     return out
 
 
@@ -58,14 +64,15 @@ def _plan_and_window_events(conn, tool):
     for r in rows:
         if r["plan_type"] and r["plan_type"] != plan:
             if plan is not None:
-                out.append(_event(r["ts"], tool, "plan", "订阅方案变化", f"{plan} → {r['plan_type']}"))
+                out.append(_event(r["ts"], tool, "plan", "订阅方案变化", f"{plan} → {r['plan_type']}",
+                                  params={"from": plan, "to": r["plan_type"]}))
             plan = r["plan_type"]
         key = (r["scope"], r["window"])
         if key not in seen:
             seen[key] = r["ts"]
             if r["ts"] > first_all + NEW_AFTER:
                 out.append(_event(r["ts"], tool, "window", "出现新的限额窗口", f"{r['scope']} · {r['window']}",
-                                  window=r["window"]))
+                                  window=r["window"], params={"scope": r["scope"], "window": r["window"]}))
     return out
 
 
@@ -84,7 +91,8 @@ def _early_resets(conn, tool):
                 out.append(_event(nxt["first_seen"], tool, "reset", "窗口提前重置",
                                   f"{scope} · {window}：上个窗口用到 {pct:.0f}%，原定 "
                                   f"{time.strftime('%m-%d %H:%M', time.localtime(prev['reset_max']))} 重置{note}",
-                                  window=window))
+                                  window=window, params={"scope": scope, "window": window, "pct": pct,
+                                                         "due": prev["reset_max"], "maybe_switch": tool == "codex"}))
     return out
 
 

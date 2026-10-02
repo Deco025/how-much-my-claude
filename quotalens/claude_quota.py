@@ -1,10 +1,16 @@
 """轮询 Claude 订阅额度百分比（Claude Code 的 /usage 用的同一个接口，非公开）。
 
-凭据只读 Claude Code 自己存的 ~/.claude/.credentials.json，绝不刷新 token：
-刷新会轮换 refresh token，导致 Claude Code 本身掉登录。token 过期时提示用户
-随便跑一次 claude 让它自己刷新。token 只发往 api.anthropic.com，不落日志。
+凭据只读 Claude Code 自己存的登录信息，绝不刷新 token：刷新会轮换 refresh token，
+导致 Claude Code 本身掉登录。token 过期时提示用户随便跑一次 claude 让它自己刷新。
+token 只发往 api.anthropic.com，不落日志。
+
+Claude Code 把登录信息存在：
+  Windows / Linux  ~/.claude/.credentials.json
+  macOS            系统钥匙串里名为「Claude Code-credentials」的项（第一次读取时系统会问要不要允许）
 """
 import json
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -21,13 +27,36 @@ VALUES ('claude', ?, ?, ?, ?, ?, ?, ?, 'api')
 """
 
 
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def _keychain_credentials():
+    """macOS 钥匙串里的 Claude Code 登录信息（JSON 文本）；没有就返回 None。只读不写。"""
+    try:
+        out = subprocess.run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+                             capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 and out.stdout.strip() else None
+
+
+def credentials_location() -> str:
+    return "macOS Keychain: " + KEYCHAIN_SERVICE if sys.platform == "darwin" else str(claude_dir() / ".credentials.json")
+
+
 def read_credentials():
     """返回 (access_token, plan, 状态说明)。状态：ok / missing / expired / error。"""
     path = claude_dir() / ".credentials.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return None, None, "missing"
+        raw = _keychain_credentials() if sys.platform == "darwin" else None
+        if raw is None:
+            return None, None, "missing"
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return None, None, "error"
     except (OSError, ValueError):
         return None, None, "error"
     entry = data.get("claudeAiOauth") or data.get("claude.ai_oauth") or {}

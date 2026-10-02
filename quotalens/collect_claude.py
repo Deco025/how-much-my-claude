@@ -80,6 +80,11 @@ def _better(new, old):
     return new["output"] > old["output"]
 
 
+def log_files():
+    root = claude_dir() / "projects"
+    return list(root.rglob("*.jsonl")) if root.is_dir() else []
+
+
 def sync(prices: PriceTable, history_days: int = 90) -> dict:
     root = claude_dir() / "projects"
     stats = {"files": 0, "changed": 0, "rows": 0}

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "how-much-my-claude"
+version = "0.2.0"
+description = "Turn Codex / Claude Code subscription usage into API-equivalent dollars and watch for silent quota changes"
+readme = "README.en.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Deco025" }]
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+  "numpy>=1.24",
+  "pywebview>=5.0",
+  "pystray>=0.19",
+  "Pillow>=9.0",
+]
+
+[project.optional-dependencies]
+test = ["httpx"]
+
+[project.urls]
+Homepage = "https://github.com/Deco025/quota-lens"
+
+# 桌面版用图形入口：Windows 上启动时不弹命令行窗口
+[project.gui-scripts]
+how-much-my-claude = "quotalens.desktop:main"
+
+[project.scripts]
+how-much-my-claude-server = "quotalens.server:main"
+how-much-my-claude-install = "quotalens.install:main"
+
+[tool.setuptools]
+packages = ["quotalens"]
+
+[tool.setuptools.package-data]
+quotalens = ["prices_seed.json", "web/*.html", "web/*.js", "web/*.css", "web/*.ico", "web/*.png", "web/vendor/*"]

@@ -1,7 +1,7 @@
 """后台任务：扫日志、自适应轮询额度、分析与告警、刷新价格、每日备份。
 
 轮询节奏：
-  Claude  日志里有新请求时每 3 分钟查一次额度（每个窗口拿到更多数据点），空闲时按 --poll-minutes。
+  Claude  日志里有新请求时每 3 分钟查一次额度（每个窗口拿到更多数据点），空闲时按「设置」里的间隔（默认 30 分钟）。
   Codex   使用中不用查（日志自带额度）；空闲 10 分钟后每 20 分钟查一次，
           空闲时额度还在涨，就是本地日志之外的消耗。
 """
@@ -10,7 +10,8 @@ import threading
 import time
 import traceback
 
-from . import calibrate, claude_quota, codex_quota, collect_claude, collect_codex, db, events, notify
+from . import calibrate, claude_quota, codex_quota, collect_claude, collect_codex, db, events, i18n, notify, settings
+from .i18n import tr
 from .pricing import PriceTable, refresh_from_models_dev
 
 log = logging.getLogger("quotalens")
@@ -29,12 +30,14 @@ WINDOW_NAMES = {"five_hour": "5 小时窗口", "seven_day": "每周窗口", "thi
 
 
 class Service:
-    def __init__(self, claude_poll_minutes=30, history_days=90, notify_desktop=True):
+    def __init__(self, claude_poll_minutes=None, history_days=None, notify_desktop=None):
+        """参数是命令行给的临时覆盖（不保存）；没给的用页面「设置」里存的值。"""
         db.init_db()
         self.prices = PriceTable()
-        self.claude_idle_poll = max(MIN_POLL_INTERVAL, claude_poll_minutes * 60)
-        self.history_days = history_days
-        self.notify_desktop = notify_desktop
+        self._overrides = {k: v for k, v in (("claude_poll_minutes", claude_poll_minutes),
+                                              ("history_days", history_days), ("notify", notify_desktop))
+                           if v is not None}
+        self.apply_settings(settings.load())
         self._sync_lock = threading.Lock()
         self._analysis_lock = threading.Lock()
         self._stop = threading.Event()
@@ -44,6 +47,23 @@ class Service:
         self._activity = {"claude": 0.0, "codex": 0.0}
         self._analysis = None
         self.reprice_if_needed()
+
+    # ── 设置 ────────────────────────────────────────────
+
+    def apply_settings(self, values):
+        self.settings = values
+        effective = {**values, **self._overrides}
+        i18n.set_language(effective["language"])
+        self.claude_idle_poll = max(MIN_POLL_INTERVAL, effective["claude_poll_minutes"] * 60)
+        self.history_days = effective["history_days"]
+        self.notify_desktop = effective["notify"]
+        self.analysis_params = {"min_change": effective["min_change_pct"] / 100,
+                                "model_overlap": effective["model_overlap_pct"] / 100}
+
+    def update_settings(self, changes):
+        self.apply_settings(settings.save(changes))
+        self.analysis(refresh=True)  # 判断阈值可能变了
+        return self.settings
 
     # ── 状态 ────────────────────────────────────────────
 
@@ -115,7 +135,7 @@ class Service:
                 with db.reader() as conn:
                     self._analysis = {
                         "at": now,
-                        "tools": {tool: calibrate.analyze(conn, tool, now) for tool in TOOLS},
+                        "tools": {tool: calibrate.analyze(conn, tool, now, self.analysis_params) for tool in TOOLS},
                         "events": events.detect(conn, now=now),
                     }
                 self._last["analysis"] = now
@@ -142,14 +162,49 @@ class Service:
                         (tool, key, g["status"], now - ALERT_COOLDOWN)).fetchone()
                     if recent:
                         continue
-                    change = (g["ratio"] - 1) * 100
-                    title = f"{'Codex' if tool == 'codex' else 'Claude'} {WINDOW_NAMES.get(g['window'], g['window'])}" \
-                            f"可能被{'收紧' if g['status'] == 'tighter' else '放宽'}了 {abs(change):.0f}%"
-                    detail = (f"最近 {g['recent_n']} 个窗口折合 {g['ref_model']} 约 ${g['recent_median']:.1f}，"
-                              f"之前 {g['baseline_n']} 个窗口约 ${g['baseline_median']:.1f}")
+                    template = ("{tool} {window}可能被收紧了 {change}%" if g["status"] == "tighter"
+                                else "{tool} {window}可能被放宽了 {change}%")
+                    title = tr(template, tool="Codex" if tool == "codex" else "Claude",
+                               window=tr(WINDOW_NAMES.get(g["window"], g["window"])),
+                               change=f"{abs(g['ratio'] - 1) * 100:.0f}")
+                    detail = tr("最近 {recent_n} 个窗口折合 {model} 约 ${recent:.1f}，之前 {baseline_n} 个窗口约 ${baseline:.1f}",
+                                recent_n=g["recent_n"], model=g["ref_model"], recent=g["recent_median"],
+                                baseline_n=g["baseline_n"], baseline=g["baseline_median"])
+                    if g.get("cross_gap"):
+                        detail += tr("（跨断档：和 {day} 之前的窗口比）",
+                                     day=time.strftime("%m-%d", time.localtime(g["baseline_to"])))
                     conn.execute("INSERT INTO alert (ts, tool, window, direction, ratio, detail) VALUES (?, ?, ?, ?, ?, ?)",
                                  (now, tool, key, g["status"], g["ratio"], f"{title}。{detail}"))
                 out.append((title, detail))
+        return out
+
+    # ── 数据管理（页面上的「数据管理」） ──────────────────
+
+    def set_rule(self, tool, kind, target, mode):
+        """标记某个方案 / 窗口不参与分析（mode="ignore"），或恢复（mode=None）。"""
+        with db.writer() as conn:
+            db.set_rule(conn, tool, kind, target, mode)
+        return self.analysis(refresh=True)
+
+    def delete_plan(self, tool, plan):
+        """删掉一个订阅方案的全部窗口数据。先整库备份一份（不参与轮换），删错了还能找回来。"""
+        with self._sync_lock:
+            backup_path = db.backup(label="before-delete")
+            with db.reader() as conn:
+                windows = [w for w in calibrate.analyze(conn, tool)["windows"] if w["plan_type"] == plan]
+            with db.writer() as conn:
+                result = db.delete_plan_data(conn, tool, plan, windows)
+        log.info("已删除 %s %s 的数据：%s，删除前的备份在 %s", tool, plan, result, backup_path)
+        self.analysis(refresh=True)
+        return {**result, "backup": backup_path}
+
+    def import_history(self):
+        """把本机上还留着的全部历史日志导进来（首次启动只导近 history_days 天）。重复导入不会重复计数。"""
+        with self._sync_lock:
+            out = {}
+            for name, mod in (("codex", collect_codex), ("claude", collect_claude)):
+                out[name] = mod.sync(self.prices, history_days=36500)
+        self.analysis(refresh=True)
         return out
 
     # ── 价格 ────────────────────────────────────────────

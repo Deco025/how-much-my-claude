@@ -1,6 +1,7 @@
 """核心逻辑测试：python -m unittest discover tests"""
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -311,6 +312,31 @@ class ClaudeQuotaParseTest(unittest.TestCase):
         self.assertIsNone(rows[("opus", "seven_day")][4])
 
 
+@unittest.skipUnless(sys.platform == "win32", "快捷方式只在 Windows 上创建")
+class InstallTest(unittest.TestCase):
+    def test_startup_toggle(self):
+        from quotalens import install
+        suffix = {"win32": ".lnk", "darwin": ".plist"}.get(sys.platform, ".desktop")
+        with tempfile.TemporaryDirectory() as d,                 mock.patch.object(install, "startup_path", lambda: Path(d) / f"autostart{suffix}"):
+            self.assertFalse(install.startup_enabled())
+            install.set_startup(True)
+            self.assertTrue(install.startup_enabled())
+            install.set_startup(False)
+            self.assertFalse(install.startup_enabled())
+
+    def test_launchers_for_other_systems(self):
+        import plistlib
+        from quotalens import install
+        cmd = ["/usr/bin/python3", "/home/me/my apps/desktop.pyw", "--hidden"]
+        entry = install.desktop_entry(cmd, autostart=True)
+        self.assertIn('Exec=/usr/bin/python3 "/home/me/my apps/desktop.pyw" --hidden', entry)
+        self.assertIn("X-GNOME-Autostart-enabled=true", entry)
+        self.assertEqual(plistlib.loads(install.launch_agent(cmd))["ProgramArguments"], cmd)
+        files = install.app_bundle_files(cmd[:2])
+        self.assertIn("exec /usr/bin/python3 '/home/me/my apps/desktop.pyw'", files["Contents/MacOS/launcher"].decode())
+        self.assertEqual(plistlib.loads(files["Contents/Info.plist"])["CFBundleExecutable"], "launcher")
+
+
 class ReviewFixesTest(TempDB):
     """代码审查发现的问题的回归测试。"""
 
@@ -398,6 +424,229 @@ class ReviewFixesTest(TempDB):
             self.assertEqual(client.get("/api/usage", headers={"host": "evil.example"}).status_code, 400)
             self.assertEqual(client.post("/api/sync", headers={"origin": "https://evil.example"}).status_code, 403)
             self.assertEqual(client.post("/api/sync", headers={"origin": "http://127.0.0.1:8787"}).status_code, 200)
+
+    def test_shutdown_stops_service_then_exits(self):
+        from fastapi.testclient import TestClient
+        from quotalens import api
+        from quotalens.service import Service
+        svc = Service(notify_desktop=False)
+        client = TestClient(api.create_app(svc), base_url="http://127.0.0.1")
+        with mock.patch.object(api.threading, "Timer") as timer:  # 别真的退出测试进程
+            self.assertEqual(client.post("/api/shutdown", headers={"origin": "https://evil.example"}).status_code, 403)
+            timer.assert_not_called()
+            self.assertEqual(client.post("/api/shutdown").status_code, 200)
+        self.assertTrue(svc._stop.is_set())
+        timer.return_value.start.assert_called_once()
+        with mock.patch.object(api.os, "_exit") as exit_:  # 浏览器版：到点后结束进程
+            timer.call_args.args[1]()
+        exit_.assert_called_once_with(0)
+        self.assertEqual(client.post("/api/show").status_code, 404)  # 浏览器版没有窗口
+
+    def test_desktop_hooks(self):
+        from fastapi.testclient import TestClient
+        from quotalens import api
+        from quotalens.service import Service
+        shown, quit_ = mock.Mock(), mock.Mock()
+        client = TestClient(api.create_app(Service(notify_desktop=False), on_show=shown, on_quit=quit_),
+                            base_url="http://127.0.0.1")
+        self.assertEqual(client.post("/api/show").status_code, 200)
+        shown.assert_called_once()
+        with mock.patch.object(api.threading, "Timer") as timer:
+            client.post("/api/shutdown")
+        self.assertIs(timer.call_args.args[1], quit_)  # 桌面版退出走窗口和托盘的正常关闭
+
+
+class LongTermTest(TempDB):
+    """断档后续上、模型换代、用户对数据的选择（不参与分析 / 删除）。"""
+
+    add, snap, codex_window, analyze = CalibrateTest.add, CalibrateTest.snap, CalibrateTest.codex_window, CalibrateTest.analyze
+
+    def two_periods(self, now, old_model="a", new_model="a"):
+        """断档前约 100 天的 8 个窗口（值 $10），停了 3 个多月后续上的 4 个窗口（值 $6）。"""
+        with db.writer() as conn:
+            for i in range(8):
+                self.codex_window(conn, f"old{i}", now - (110 - 2 * i) * 86400, [(0.5, 5)] * 10, model=old_model)
+            for i in range(4):
+                self.codex_window(conn, f"new{i}", now - (60 - 12 * i) * 3600, [(0.3, 5)] * 10, model=new_model)
+
+    def test_gap_compares_with_windows_before_the_break(self):
+        now = 200 * 86400
+        self.two_periods(now)
+        group = self.analyze("codex", now)["groups"][0]
+        # 以前：断档前的窗口超出 60 天就不算了，只能显示「样本不足」，断档期间的收紧会被悄悄吸收
+        self.assertEqual(group["status"], "tighter")
+        self.assertTrue(group["cross_gap"])
+        self.assertAlmostEqual(group["ratio"], 0.6, delta=0.05)
+        self.assertGreater(group["gap_days"], 80)
+        roles = [p["role"] for p in group["trend"]]
+        self.assertEqual((roles.count("baseline"), roles.count("recent")), (8, 4))
+
+    def test_model_change_is_reported_not_alerted(self):
+        now = 200 * 86400
+        self.two_periods(now, old_model="old-model", new_model="new-model")
+        group = self.analyze("codex", now)["groups"][0]
+        # 前后没有共同模型：汇率会把收紧当成「新模型本来就贵」，所以不下结论，只给 API 等价金额的粗比
+        self.assertEqual(group["status"], "model_changed")
+        self.assertEqual((group["model_before"], group["model_after"]), ("old-model", "new-model"))
+        self.assertAlmostEqual(group["raw_ratio"], 0.6, delta=0.05)
+
+    def test_ignored_windows_and_plan(self):
+        now = 50 * 86400
+        with db.writer() as conn:
+            for i in range(8):
+                self.codex_window(conn, f"old{i}", now - (20 - 2 * i) * 86400, [(0.5, 5)] * 10)
+            for i in range(4):
+                self.codex_window(conn, f"new{i}", now - (60 - 12 * i) * 3600, [(0.3, 5)] * 10)
+        recent = [w for w in self.analyze("codex", now)["windows"] if w["end"] > now - 4 * 86400]
+        with db.writer() as conn:
+            for w in recent[:2]:
+                db.set_rule(conn, "codex", "window", w["key"], "ignore")
+        group = self.analyze("codex", now)["groups"][0]
+        self.assertEqual(group["status"], "insufficient")  # 最近只剩 2 个窗口，不够 3 个
+        self.assertEqual(sum(p["excluded"] for p in group["trend"]), 2)
+        with db.writer() as conn:
+            db.set_rule(conn, "codex", "window", recent[0]["key"], None)  # 恢复一个
+            db.set_rule(conn, "codex", "plan", "plus", "ignore")
+        self.assertEqual(self.analyze("codex", now)["groups"][0]["status"], "ignored")
+
+    def test_deleted_plan_does_not_come_back(self):
+        home = Path(self.tmp.name) / "codex"
+        f = home / "sessions" / "2026" / "09" / "30" / "rollout-a.jsonl"
+        f.parent.mkdir(parents=True)
+        lines, total = [b'{"type":"turn_context","payload":{"model":"gpt-x"}}\n'], [0, 0, 0]
+        base = 1_790_762_400  # 2026-09-30T10:00:00Z；重置时间要在请求之后，请求才会挂到窗口上
+        for i in range(1, 21):  # 前 10 次请求用 team 账号，后 10 次换成 plus 账号
+            plan, reset5 = ("team", base + 5_000) if i <= 10 else ("plus", base + 20_000)
+            last = [250_000, 0, 0]
+            total = [t + x for t, x in zip(total, last)]
+            lines.append(token_count(f"2026-09-30T10:{i:02d}:00Z", last, total,
+                                     codex_rl(i * 1.0, reset5, 1.0, reset5 + 500_000, plan)))
+        f.write_bytes(b"".join(lines))
+        table = pricing.PriceTable.__new__(pricing.PriceTable)
+        table.models = {"gpt-x": {"input": 2, "output": 10}}
+
+        def counts():
+            with db.reader() as conn:
+                return (conn.execute("SELECT COUNT(*) FROM usage").fetchone()[0],
+                        {r[0] for r in conn.execute("SELECT DISTINCT plan_type FROM quota_snapshot")})
+
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+            collect_codex.sync(table, history_days=10_000)
+            self.assertEqual(counts(), (20, {"team", "plus"}))
+            with db.reader() as conn:
+                team = [w for w in calibrate.analyze(conn, "codex", now=base + 30_000)["windows"] if w["plan_type"] == "team"]
+            with db.writer() as conn:
+                result = db.delete_plan_data(conn, "codex", "team", team)
+            self.assertEqual(result["requests"], 10)
+            self.assertEqual(counts(), (10, {"plus"}))
+            # 重读全部日志（例如游标被清掉）：删掉的方案不会再导回来，别的方案照常
+            with db.writer() as conn:
+                conn.execute("DELETE FROM file_cursor")
+            collect_codex.sync(table, history_days=10_000)
+        self.assertEqual(counts(), (10, {"plus"}))
+
+    def test_data_api(self):
+        from fastapi.testclient import TestClient
+        from quotalens.api import create_app
+        from quotalens.service import Service
+        with db.writer() as conn:
+            self.codex_window(conn, "w", 1_000_000, [(0.5, 5)] * 4)
+        svc = Service(notify_desktop=False)
+        client = TestClient(create_app(svc), base_url="http://127.0.0.1")
+        with mock.patch.object(collect_codex, "log_files", return_value=[]), \
+                mock.patch.object(collect_claude, "log_files", return_value=[]):
+            data = client.get("/api/data").json()
+        self.assertEqual([(g["tool"], g["plan"], g["mode"]) for g in data["groups"]], [("codex", "plus", "keep")])
+        body = {"tool": "codex", "kind": "plan", "target": "plus", "ignore": True}
+        self.assertEqual(client.post("/api/data/rule", json=body, headers={"origin": "https://evil.example"}).status_code, 403)
+        self.assertEqual(client.post("/api/data/rule", json=body).status_code, 200)
+        statuses = [g["status"] for g in svc.analysis()["tools"]["codex"]["groups"]]
+        self.assertEqual(statuses, ["ignored"])
+
+
+class OpenSourceTest(TempDB):
+    """开源后别人的环境：数据目录迁移、设置、各系统的登录信息和通知、连接状态接口。"""
+
+    def test_legacy_data_is_copied_not_moved(self):
+        from quotalens import paths
+        root = Path(self.tmp.name)
+        legacy, new = root / "project" / "data", root / "appdata"
+        legacy.mkdir(parents=True)
+        (root / "project" / "prices_override.json").write_text('{"models": {}}', encoding="utf-8")
+        with mock.patch.object(db, "DATA_DIR", legacy), mock.patch.object(db, "DB_PATH", legacy / "quotalens.db"):
+            db.init_db()
+            with db.writer() as conn:
+                conn.execute("INSERT INTO usage (id, tool, ts, model, on_plan) VALUES ('a', 'codex', 1, 'm', 1)")
+        self.assertEqual(paths.migrate_legacy_data(legacy, new), legacy)
+        with mock.patch.object(db, "DB_PATH", new / "quotalens.db"), db.reader() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM usage").fetchone()[0], 1)
+        self.assertTrue((legacy / "quotalens.db").exists())  # 旧的不删
+        self.assertTrue((legacy / "MOVED.txt").exists())
+        self.assertTrue((new / "prices_override.json").exists())
+        self.assertIsNone(paths.migrate_legacy_data(legacy, new))  # 只迁一次
+
+    def test_settings_are_validated_and_applied(self):
+        from quotalens import settings
+        from quotalens.service import Service
+        values = settings.save({"min_change_pct": 500, "language": "fr", "notify": "yes", "unknown": 1})
+        self.assertEqual(values["min_change_pct"], 60)       # 夹到上限
+        self.assertEqual(values["language"], "auto")          # 不认识的值不收
+        self.assertIs(values["notify"], True)
+        svc = Service(notify_desktop=False)                   # 命令行覆盖优先
+        self.assertFalse(svc.notify_desktop)
+        self.assertAlmostEqual(svc.analysis_params["min_change"], 0.6)
+        svc.update_settings({"min_change_pct": 25})
+        self.assertAlmostEqual(svc.analysis_params["min_change"], 0.25)
+
+    def test_claude_credentials_from_macos_keychain(self):
+        home = Path(self.tmp.name) / "claude"
+        home.mkdir()
+        secret = json.dumps({"claudeAiOauth": {"accessToken": "tok", "subscriptionType": "pro",
+                                               "expiresAt": 4_000_000_000_000}})
+        run = mock.Mock(return_value=mock.Mock(returncode=0, stdout=secret))
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}),                 mock.patch.object(claude_quota.sys, "platform", "darwin"),                 mock.patch.object(claude_quota.subprocess, "run", run):
+            self.assertEqual(claude_quota.read_credentials(), ("tok", "pro", "ok"))
+            self.assertEqual(run.call_args.args[0][:2], ["security", "find-generic-password"])
+            run.return_value = mock.Mock(returncode=44, stdout="")
+            self.assertEqual(claude_quota.read_credentials()[2], "missing")
+
+    def test_notification_command_per_system(self):
+        from quotalens import notify
+        with mock.patch.object(notify.sys, "platform", "darwin"):
+            args, env = notify.command("标题 \"x\"", "正文")
+            self.assertEqual((args[0], args[-2:]), ("osascript", ["标题 \"x\"", "正文"]))  # 文字作为参数，不拼进脚本
+        with mock.patch.object(notify.sys, "platform", "linux"),                 mock.patch.object(notify.shutil, "which", lambda name: None):
+            self.assertIsNone(notify.command("a", "b"))       # 没有 notify-send 就跳过
+
+    def test_backend_translation(self):
+        from quotalens import i18n
+        try:
+            i18n.set_language("en")
+            self.assertEqual(i18n.tr("立即同步"), "Sync now")
+            self.assertEqual(i18n.tr("已创建：{path}", path="x"), "Created: x")
+            i18n.set_language("zh")
+            self.assertEqual(i18n.tr("已创建：{path}", path="x"), "已创建：x")
+        finally:
+            i18n.set_language("auto")
+
+    def test_settings_and_connections_api(self):
+        from fastapi.testclient import TestClient
+        from quotalens.api import create_app
+        from quotalens.service import Service
+        client = TestClient(create_app(Service(notify_desktop=False)), base_url="http://127.0.0.1")
+        self.assertEqual(client.post("/api/settings", json={"language": "en"}).json()["values"]["language"], "en")
+        self.assertEqual(client.get("/api/settings").json()["values"]["language"], "en")
+        with mock.patch.dict(os.environ, {"CODEX_HOME": self.tmp.name, "CLAUDE_CONFIG_DIR": self.tmp.name}),                 mock.patch.object(claude_quota.sys, "platform", "linux"):
+            conns = {c["tool"]: c for c in client.get("/api/connections").json()}
+        self.assertEqual((conns["claude"]["log_files"], conns["claude"]["credentials"]), (0, "missing"))
+        self.assertNotIn("token", json.dumps(conns))
+
+    def test_events_carry_raw_params(self):
+        with db.writer() as conn:
+            conn.execute("INSERT INTO quota_snapshot VALUES ('codex', 'codex', 'seven_day', 1000, 5, 700000, 604800, 'free', 'log')")
+            conn.execute("INSERT INTO quota_snapshot VALUES ('codex', 'codex', 'seven_day', 2000, 6, 700000, 604800, 'plus', 'log')")
+            plan = [e for e in events.detect(conn, now=3000) if e["kind"] == "plan"][0]
+        self.assertEqual(plan["params"], {"from": "free", "to": "plus"})
 
 
 if __name__ == "__main__":

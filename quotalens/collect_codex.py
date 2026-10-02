@@ -8,6 +8,7 @@
 这些重复行的 (total_token_usage, last_token_usage) 完全相同，用它的哈希做主键，
 INSERT OR IGNORE 天然去重，重读文件也不会双算。
 归属：每次请求挂到同一事件（或本文件最近一次）rate_limits 报告的窗口上，见 usage_window 表。
+删除：用户在页面上删掉某个订阅方案的数据后，重读日志时跳过删除时刻之前属于该方案的快照和请求。
 """
 import hashlib
 import json
@@ -72,10 +73,11 @@ class FileState:
         self.session_id = raw.get("session_id")
         self.high = raw.get("high")  # total_token_usage 的高水位，只在缺 last_token_usage 时用
         self.links = raw.get("links") or []  # 最近一次 rate_limits 里的 [scope, window, resets_at]
+        self.plan = raw.get("plan")  # 最近一次 rate_limits 里的订阅方案
 
     def dump(self):
         return json.dumps({"model": self.model, "session_id": self.session_id, "high": self.high,
-                           "links": self.links})
+                           "links": self.links, "plan": self.plan})
 
 
 def parse_line(raw: bytes, state: FileState, schemas=None):
@@ -103,6 +105,8 @@ def parse_line(raw: bytes, state: FileState, schemas=None):
     links = [[scope, window, resets] for scope, window, _, _, resets, _, _ in snapshots if resets]
     if links:
         state.links = links
+    if snapshots and snapshots[0][6]:
+        state.plan = snapshots[0][6]
     info = payload.get("info")
     if not isinstance(info, dict):
         return None, snapshots
@@ -140,8 +144,14 @@ def parse_line(raw: bytes, state: FileState, schemas=None):
         "reasoning": reasoning,
         # 沿用的旧链接只在窗口还没重置时有效，否则会把新窗口的用量算到已过期的窗口上
         "links": [link for link in state.links if link[2] > ts],
+        "plan": state.plan,
     }
     return rec, snapshots
+
+
+def _deleted(plan, ts, deleted):
+    """这条数据属于用户删掉的方案，并且发生在删除之前。"""
+    return plan in deleted and ts <= deleted[plan]
 
 
 def _rollout_files(root):
@@ -151,12 +161,17 @@ def _rollout_files(root):
             yield from d.rglob("rollout-*.jsonl")
 
 
+def log_files():
+    return list(_rollout_files(codex_dir()))
+
+
 def sync(prices: PriceTable, history_days: int = 90) -> dict:
     root = codex_dir()
     stats = {"files": 0, "changed": 0, "rows": 0, "snapshots": 0}
     cutoff = time.time() - history_days * 86400
     with db.writer() as conn:
         cursors = {r["path"]: r for r in conn.execute("SELECT * FROM file_cursor WHERE path LIKE ?", (str(root) + "%",))}
+        deleted = {plan: until for plan, (mode, until) in db.data_rules(conn, TOOL)["plans"].items() if mode == "deleted"}
         for path in _rollout_files(root):
             stats["files"] += 1
             key = str(path)
@@ -172,8 +187,8 @@ def sync(prices: PriceTable, history_days: int = 90) -> dict:
                 usage_rows, snap_rows, schemas, end = [], [], {}, start
                 for raw, end in iter_complete_lines(path, start):
                     rec, snaps = parse_line(raw, state, schemas)
-                    snap_rows.extend(snaps)
-                    if rec:
+                    snap_rows.extend(r for r in snaps if not _deleted(r[6], r[2], deleted))
+                    if rec and not _deleted(rec["plan"], rec["ts"], deleted):
                         usage_rows.append(rec)
             except OSError:
                 continue

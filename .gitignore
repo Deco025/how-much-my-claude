@@ -1,4 +1,10 @@
+# 0.2 之前的数据目录（现在默认在系统的用户数据目录）
 data/
 prices_override.json
 __pycache__/
 *.pyc
+tools/icon_preview.png
+*.egg-info/
+build/
+dist/
+.venv/

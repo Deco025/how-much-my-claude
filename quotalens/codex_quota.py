@@ -23,6 +23,10 @@ VALUES ('codex', ?, ?, ?, ?, ?, ?, ?, 'api')
 """
 
 
+def credentials_location() -> str:
+    return str(codex_dir() / "auth.json")
+
+
 def read_credentials():
     """返回 (access_token, account_id, 状态)。状态：ok / missing / expired / error。"""
     try:

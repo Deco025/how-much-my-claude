@@ -8,6 +8,9 @@ meta           杂项（当前入库费用所用的价格表版本）
 raw_response   额度接口的原始响应归档（相同内容只延长时间范围），留作证据
 schema_seen    额度数据的字段结构指纹及首末出现时间，用来发现接口 / 日志格式变化
 alert          额度变化告警
+data_rule      用户在页面上对数据做的选择：某个订阅方案 / 某个窗口不参与分析，或某个方案的数据已删除
+
+数据默认永久保存，不会自动清理；Claude Code 默认 30 天后删掉自己的日志，这里的副本不受影响。
 """
 import hashlib
 import json
@@ -105,6 +108,16 @@ CREATE TABLE IF NOT EXISTS alert (
     direction TEXT NOT NULL,     -- tighter / looser
     ratio     REAL NOT NULL,
     detail    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS data_rule (
+    tool   TEXT NOT NULL,
+    kind   TEXT NOT NULL,        -- plan：整个订阅方案；window：单个窗口
+    target TEXT NOT NULL,        -- plan_type，或窗口键 scope:window:首次重置时间
+    mode   TEXT NOT NULL,        -- ignore：保留但不参与分析；deleted：已删除
+    until  REAL,                 -- deleted：删除时刻。重读日志时跳过这之前属于该方案的数据，删掉的不会回来
+    ts     REAL NOT NULL,
+    PRIMARY KEY (tool, kind, target)
 );
 """
 
@@ -208,11 +221,63 @@ def note_schema(conn, tool: str, source: str, obj, first_ts: float, last_ts: flo
         (tool, source, fp, first_ts, last_ts, json.dumps(paths)))
 
 
-def backup(keep: int = 14) -> str:
-    """把数据库备份到 data/backups/，保留最近 keep 份。"""
+def data_rules(conn, tool: str) -> dict:
+    """{"plans": {plan_type: (mode, until)}, "windows": {窗口键, ...}}"""
+    out = {"plans": {}, "windows": set()}
+    for r in conn.execute("SELECT kind, target, mode, until FROM data_rule WHERE tool = ?", (tool,)):
+        if r["kind"] == "plan":
+            out["plans"][r["target"]] = (r["mode"], r["until"])
+        elif r["kind"] == "window" and r["mode"] == "ignore":
+            out["windows"].add(r["target"])
+    return out
+
+
+def set_rule(conn, tool: str, kind: str, target: str, mode, until=None) -> None:
+    """mode 为 None 表示取消这条选择（恢复默认：保留并参与分析）。"""
+    if mode is None:
+        conn.execute("DELETE FROM data_rule WHERE tool = ? AND kind = ? AND target = ?", (tool, kind, target))
+    else:
+        conn.execute("INSERT OR REPLACE INTO data_rule (tool, kind, target, mode, until, ts) VALUES (?, ?, ?, ?, ?, ?)",
+                     (tool, kind, target, mode, until, time.time()))
+
+
+def delete_plan_data(conn, tool: str, plan: str, windows) -> dict:
+    """删掉一个订阅方案的数据：它的额度快照，以及（Codex）只属于这些窗口的请求。
+
+    windows 是这个方案的窗口（含 _reset_min / _reset_max）。Claude 的请求不分方案，保留在用量统计里。
+    记一条 deleted 规则，以后重读日志时跳过，删掉的数据不会再导回来。
+    """
+    snapshots = requests = 0
+    usage_ids = set()
+    for w in windows:
+        lo, hi = w["_reset_min"] - 1, w["_reset_max"] + 1
+        # 没记方案的旧快照跟着窗口走；同一时段别的账号的快照（方案不同）不动
+        snapshots += conn.execute(
+            "DELETE FROM quota_snapshot WHERE tool = ? AND scope = ? AND window = ? AND resets_at BETWEEN ? AND ? "
+            "AND (plan_type = ? OR plan_type IS NULL)", (tool, w["scope"], w["window"], lo, hi, plan)).rowcount
+        args = (tool, w["scope"], w["window"], lo, hi)
+        usage_ids.update(r[0] for r in conn.execute(
+            "SELECT usage_id FROM usage_window WHERE tool = ? AND scope = ? AND window = ? AND resets_at BETWEEN ? AND ?",
+            args))
+        conn.execute("DELETE FROM usage_window WHERE tool = ? AND scope = ? AND window = ? AND resets_at BETWEEN ? AND ?",
+                     args)
+        conn.execute("DELETE FROM data_rule WHERE tool = ? AND kind = 'window' AND target = ?", (tool, w["key"]))
+    snapshots += conn.execute("DELETE FROM quota_snapshot WHERE tool = ? AND plan_type = ?", (tool, plan)).rowcount
+    for uid in usage_ids:
+        if not conn.execute("SELECT 1 FROM usage_window WHERE usage_id = ? LIMIT 1", (uid,)).fetchone():
+            requests += conn.execute("DELETE FROM usage WHERE id = ?", (uid,)).rowcount
+    set_rule(conn, tool, "plan", plan, "deleted", until=time.time())
+    return {"snapshots": snapshots, "requests": requests, "windows": len(windows)}
+
+
+def backup(keep: int = 14, label=None) -> str:
+    """把数据库备份到 data/backups/，保留最近 keep 份每日备份。
+
+    label 用于改动前的一次性备份（例如删除数据前），文件名带时间，不参与轮换、不会被自动删掉。
+    """
     folder = DATA_DIR / "backups"
     folder.mkdir(parents=True, exist_ok=True)
-    target = folder / time.strftime("quotalens-%Y%m%d.db")
+    target = folder / (time.strftime(f"{label}-%Y%m%d-%H%M%S.db") if label else time.strftime("quotalens-%Y%m%d.db"))
     src = connect()
     try:
         dst = sqlite3.connect(target)

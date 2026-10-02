@@ -88,6 +88,7 @@ def is_on_plan(tool: str, model: str) -> bool:
 class PriceTable:
     def __init__(self):
         self.models: dict = {}
+        self.sources: dict = {}  # 模型 → seed / models.dev / override（页面上的价格表显示来源）
         self.fetched_at = None
         self.version = ""
         self.reload()
@@ -96,22 +97,26 @@ class PriceTable:
         """重新合并三层价格表。"""
         seed = _read_json(PRICE_SEED_PATH) or {}
         models = dict(seed.get("models", {}))
+        sources = dict.fromkeys(models, "seed")
         cache = _read_json(PRICE_CACHE_PATH) or {}
         models.update(cache.get("models", {}))
+        sources.update(dict.fromkeys(cache.get("models", {}), "models.dev"))
         override = (_read_json(PRICE_OVERRIDE_PATH) or {}).get("models", {})
         for name, entry in override.items():
             if isinstance(entry, dict) and "same_as" in entry:
                 _, target = self._find_in(models, str(entry["same_as"]))
                 if target:
                     models[name.lower()] = dict(target, alias_of=entry["same_as"])
+                    sources[name.lower()] = "override"
                 else:
                     log.warning("prices_override.json：%s 的 same_as 指向的 %s 没有价格，已忽略", name, entry["same_as"])
             elif _valid_price(entry):
                 models[name.lower()] = entry
+                sources[name.lower()] = "override"
             else:
                 # 缺 input / output 的条目会让计价报错、导致整个采集停下，宁可忽略
                 log.warning("prices_override.json：%s 缺少数值型的 input / output，已忽略", name)
-        self.models = models
+        self.models, self.sources = models, sources
         self.version = hashlib.sha1(json.dumps(models, sort_keys=True).encode()).hexdigest()
         self.fetched_at = cache.get("fetched_at") or seed.get("fetched_at")
 

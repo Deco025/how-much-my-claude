@@ -1,3 +1,6 @@
 fastapi>=0.110
 uvicorn>=0.29
 numpy>=1.24
+pywebview>=5.0
+pystray>=0.19
+Pillow>=9.0

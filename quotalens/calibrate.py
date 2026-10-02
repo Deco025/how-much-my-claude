@@ -12,11 +12,17 @@
      实测额度消耗和 API 价格不成正比，不同模型同样花 $1 吃掉的额度可以差几倍。
   5. 趋势：每个窗口折算成「全用主力模型时，一个窗口值多少钱」，消除模型组合的影响。
      最近的窗口和之前几周对比，偏离超过噪声就判为收紧 / 放宽。
+     断档：之前几周没有可比的窗口（停用、退订过一段时间）时，拿断档前最后几个窗口当基线，
+     不让断档期间发生的调整被悄悄吸收成「新常态」。
+  6. 换代：最近窗口和基线窗口的主力模型不同（几乎没有共同模型）时，额度变化和模型差异分不开，
+     只给按 API 等价金额的粗略对比，不报警。
 
 百分比的两个毛病：只有整数精度（推算给区间），并行会话会报旧值（取单调最大值）。
 """
 import statistics
 import time
+
+from . import db
 
 # (工具, scope) → 计入该限额的模型名过滤（SQL LIKE）；None 表示该工具全部官方模型
 SCOPE_FILTERS = {
@@ -29,7 +35,7 @@ SCOPE_FILTERS = {
 LINKED_TOOLS = {"codex"}
 RESET_JITTER = 900       # 同一窗口的 resets_at 在相邻快照间的最大漂移（秒）
 
-ANALYSIS_DAYS = 60       # 汇率拟合和趋势图的时间范围
+ANALYSIS_DAYS = 60       # 汇率拟合和趋势图的时间范围（断档前用作基线的窗口另外补进来）
 MIN_FIT_PCT = 5          # 已用% 太小的窗口分辨率不够，不参与拟合
 MIN_TREND_PCT = 10       # 参与趋势判断的最低已用%
 MIN_MODEL_WINDOWS = 2    # 模型至少出现在几个窗口里才单独估计汇率，否则并入「其他」
@@ -44,6 +50,13 @@ CONTAMINATED_SHARE = 0.15
 MIN_CHANGE = 0.20        # 低于这个幅度的变化不报（单窗口噪声约 ±20%）
 CHANGE_Z = 2.5
 DEFAULT_SPREAD = 0.20    # 基线窗口太少、算不出离散度时的假设值
+
+# 最近 vs 基线的取法。5 小时窗口：最近 72 小时 vs 之前 3 周；长窗口：最新 1 个 vs 6 周内的前几个。
+# 基线不够时往前找，取断档前最后 fallback 个窗口
+SHORT_RULE = {"recent": 72 * 3600, "baseline": 21 * 86400, "min_recent": 3, "min_baseline": 5, "fallback": 10}
+LONG_RULE = {"baseline": 42 * 86400, "min_recent": 1, "min_baseline": 2, "fallback": 4}
+MODEL_OVERLAP = 0.5      # 最近窗口的花费里，至少一半来自基线期也在用的模型，前后才可比
+SHARED_MODEL_SHARE = 0.10  # 模型在基线期花费里占到这么多，才算「基线期也在用」
 
 
 def confidence(pct: float) -> str:
@@ -154,6 +167,10 @@ def _build_window(conn, tool, inst, now):
         "external_pct": 0.0, "pct_clean": running, "contaminated": False,
         "cap": None, "cap_low": None, "cap_high": None, "confidence": None,
         "value": None, "index": None, "in_trend": False,
+        # 窗口键：首次看到的重置时间不随后续快照漂移，用来记住用户「不参与分析」的选择
+        "key": f"{inst['scope']}:{inst['window']}:{int(inst['reset_min'])}",
+        "_reset_min": inst["reset_min"], "_reset_max": inst["reset_max"],
+        "excluded": False, "role": None,
     }
 
 
@@ -263,38 +280,113 @@ def _robust_spread(values):
     return max(1.4826 * mad / med, 0.05) if med else DEFAULT_SPREAD
 
 
-def _change_status(trend, window_seconds, now):
-    """最近的窗口 vs 之前的基线：stable / tighter / looser / insufficient。"""
+def _split(windows, window_seconds, now):
+    """按对比规则分成 (最近, 近期基线, 最近之前的全部窗口按时间排序, 规则)。"""
     if window_seconds <= 6 * 3600:
-        recent = [w for w in trend if w["last_seen"] >= now - 72 * 3600]
-        baseline = [w for w in trend if now - 21 * 86400 <= w["last_seen"] < now - 72 * 3600]
-        min_recent, min_baseline = 3, 5
+        rule = SHORT_RULE
+        cut = now - rule["recent"]
+        recent = [w for w in windows if w["last_seen"] >= cut]
+        older = sorted((w for w in windows if w["last_seen"] < cut), key=lambda w: w["last_seen"])
+        baseline = [w for w in older if w["last_seen"] >= now - rule["baseline"]]
     else:
-        ordered = sorted(trend, key=lambda w: w["end"])
-        recent = ordered[-1:]
-        baseline = [w for w in ordered[:-1] if w["end"] >= now - 42 * 86400][-4:]
-        min_recent, min_baseline = 1, 2
+        rule = LONG_RULE
+        ordered = sorted(windows, key=lambda w: w["end"])
+        recent, older = ordered[-1:], ordered[:-1]
+        baseline = [w for w in older if w["end"] >= now - rule["baseline"]][-4:]
+    return recent, baseline, older, rule
+
+
+def _gap_anchors(windows, window_seconds, now):
+    """近期基线不够时（中间停用过），断档前最后几个可用窗口，补进汇率拟合和趋势。"""
+    candidates = [w for w in windows if w["used_percent"] >= MIN_TREND_PCT]
+    _, baseline, older, rule = _split(candidates, window_seconds, now)
+    if len(baseline) >= rule["min_baseline"]:
+        return []
+    # 多留几个：拟合后可能有窗口被判为外部消耗污染
+    return older[-(rule["fallback"] + 4):]
+
+
+def _spend_shares(windows):
+    total = {}
+    for w in windows:
+        for (model, unit), v in w["_vec"].items():
+            if unit == "usd":
+                total[model] = total.get(model, 0.0) + v
+    s = sum(total.values())
+    return {m: v / s for m, v in total.items()} if s > 0 else {}
+
+
+def _model_overlap(recent, baseline):
+    """(最近窗口的花费里来自基线期也在用的模型的比例, 基线主力模型, 最近主力模型)。"""
+    r, b = _spend_shares(recent), _spend_shares(baseline)
+    if not r or not b:
+        return 1.0, None, None
+    shared = sum(v for m, v in r.items() if b.get(m, 0.0) >= SHARED_MODEL_SHARE)
+    return shared, max(b, key=b.get), max(r, key=r.get)
+
+
+DEFAULT_PARAMS = {"min_change": MIN_CHANGE, "model_overlap": MODEL_OVERLAP}
+
+
+def _change_status(trend, window_seconds, now, params=DEFAULT_PARAMS):
+    """最近的窗口 vs 之前的基线：stable / tighter / looser / model_changed / insufficient。
+
+    params 来自页面「设置」：min_change 判为被调的最小幅度，model_overlap 共同模型低于多少算换了模型。
+    """
+    recent, baseline, older, rule = _split(trend, window_seconds, now)
+    cross_gap = False
+    if len(baseline) < rule["min_baseline"] and len(older) >= rule["min_baseline"]:
+        baseline, cross_gap = older[-rule["fallback"]:], True
     out = {"recent_n": len(recent), "baseline_n": len(baseline), "status": "insufficient",
-           "ratio": None, "threshold": None, "recent_median": None, "baseline_median": None}
-    if len(recent) < min_recent or len(baseline) < min_baseline:
+           "ratio": None, "threshold": None, "recent_median": None, "baseline_median": None,
+           "cross_gap": cross_gap, "baseline_from": None, "baseline_to": None, "gap_days": None,
+           "model_before": None, "model_after": None, "model_overlap": None,
+           "raw_ratio": None, "raw_recent": None, "raw_baseline": None}
+    if baseline:
+        out["baseline_from"] = min(w["start"] for w in baseline)
+        out["baseline_to"] = max(w["end"] for w in baseline)
+    if len(recent) < rule["min_recent"] or len(baseline) < rule["min_baseline"]:
         return out
+    for w in recent:
+        w["role"] = "recent"
+    for w in baseline:
+        w["role"] = "baseline"
+    if cross_gap:
+        out["gap_days"] = max(0.0, (min(w["start"] for w in recent) - out["baseline_to"]) / 86400)
+
     r_vals, b_vals = [w["value"] for w in recent], [w["value"] for w in baseline]
     r_med, b_med = statistics.median(r_vals), statistics.median(b_vals)
     ratio = r_med / b_med
-    threshold = max(MIN_CHANGE, CHANGE_Z * _robust_spread(b_vals) * (1 / len(r_vals) + 1 / len(b_vals)) ** 0.5)
-    status = "tighter" if ratio < 1 - threshold else "looser" if ratio > 1 + threshold else "stable"
-    out.update(status=status, ratio=ratio, threshold=threshold, recent_median=r_med, baseline_median=b_med)
+    threshold = max(params["min_change"],
+                    CHANGE_Z * _robust_spread(b_vals) * (1 / len(r_vals) + 1 / len(b_vals)) ** 0.5)
+    out.update(ratio=ratio, threshold=threshold, recent_median=r_med, baseline_median=b_med)
+
+    # 换代：前后几乎没有共同模型时，汇率回归会把额度变化当成「新模型本来就贵」吸收掉，分不开
+    overlap, before, after = _model_overlap(recent, baseline)
+    out.update(model_overlap=overlap, model_before=before, model_after=after)
+    if overlap < params["model_overlap"]:
+        raw_r = [w["cap"] for w in recent if w["cap"]]
+        raw_b = [w["cap"] for w in baseline if w["cap"]]
+        if raw_r and raw_b:
+            out.update(raw_recent=statistics.median(raw_r), raw_baseline=statistics.median(raw_b))
+            out["raw_ratio"] = out["raw_recent"] / out["raw_baseline"]
+        out["status"] = "model_changed"
+        return out
+    out["status"] = "tighter" if ratio < 1 - threshold else "looser" if ratio > 1 + threshold else "stable"
     return out
 
 
-def _analyze_group(windows, now):
-    """同一 (scope, 窗口类型) 的全部窗口：识别外部消耗、拟合汇率、折算价值、判断变化。"""
-    recent = [w for w in windows if w["end"] >= now - ANALYSIS_DAYS * 86400]
+def _analyze_group(windows, now, params=DEFAULT_PARAMS):
+    """同一 (scope, 窗口类型, 方案) 的全部窗口：识别外部消耗、拟合汇率、折算价值、判断变化。"""
+    usable = [w for w in windows if not w["excluded"]]
+    recent = [w for w in usable if w["end"] >= now - ANALYSIS_DAYS * 86400]
+    anchors = [w for w in _gap_anchors(usable, windows[0]["window_seconds"], now) if w not in recent]
+    fit_set = recent + anchors
     # 第一轮：所有窗口粗拟合 → 识别外部消耗；第二轮：只用干净窗口、扣掉外部消耗后重新拟合
-    fit = _fit_rates([w for w in recent if w["used_percent"] >= MIN_FIT_PCT], "used_percent")
+    fit = _fit_rates([w for w in fit_set if w["used_percent"] >= MIN_FIT_PCT], "used_percent")
     for w in windows:
         _detect_external(w, fit)
-    clean_fit = _fit_rates([w for w in recent if not w["contaminated"] and w["pct_clean"] >= MIN_FIT_PCT], "pct_clean")
+    clean_fit = _fit_rates([w for w in fit_set if not w["contaminated"] and w["pct_clean"] >= MIN_FIT_PCT], "pct_clean")
     if clean_fit:
         fit = clean_fit
         for w in windows:
@@ -311,9 +403,9 @@ def _analyze_group(windows, now):
             group["rates"].append({"model": model, "unit": unit, "windows": fit["presence"][(model, unit)],
                                    "pct_per_unit": rate, "cap_if_only": 100 / rate if rate > 1e-9 else None})
         group["rates"].sort(key=lambda r: -r["windows"])
-        # 主力模型：干净窗口里花费最多、且有汇率的有价模型
+        # 主力模型：最近这段时间（不含断档前补进来的窗口）干净窗口里花费最多、且有汇率的有价模型
         spend = {}
-        for w in recent:
+        for w in (recent or fit_set):
             if not w["contaminated"]:
                 for k, v in w["_vec"].items():
                     if k[1] == "usd" and fit["rates"].get(k, 0) > 0:
@@ -321,15 +413,16 @@ def _analyze_group(windows, now):
         if spend:
             ref = max(spend, key=spend.get)
             group["ref_model"], group["ref_cap"] = ref[0], 100 / fit["rates"][ref]
+            in_range = {id(w) for w in fit_set}
             for w in windows:
                 expected, covered = _expected(w["_vec"], fit)
                 if expected > 0 and w["pct_clean"] > 0 and covered / expected >= 0.7:
                     w["index"] = w["pct_clean"] / expected
                     w["value"] = group["ref_cap"] / w["index"]
-                    w["in_trend"] = (not w["contaminated"] and w["pct_clean"] >= MIN_TREND_PCT
-                                     and w["end"] >= now - ANALYSIS_DAYS * 86400)
+                    w["in_trend"] = (not w["contaminated"] and not w["excluded"]
+                                     and w["pct_clean"] >= MIN_TREND_PCT and id(w) in in_range)
     trend = [w for w in windows if w["in_trend"]]
-    group.update(_change_status(trend, windows[0]["window_seconds"], now))
+    group.update(_change_status(trend, windows[0]["window_seconds"], now, params))
     return group
 
 
@@ -345,27 +438,37 @@ def _fill_plans(windows):
                 w["plan_type"] = min(known, key=lambda k: abs(k["start"] - w["start"]))["plan_type"]
 
 
-def analyze(conn, tool, now=None):
+def analyze(conn, tool, now=None, params=None):
     """返回 {"windows": [...], "groups": [...]}；窗口按开始时间排序。
 
     不同订阅方案的额度本来就不同，所以分组键里带上方案，换方案不会被当成暗调。
+    用户在页面上标了「不参与分析」的窗口不进拟合和趋势；整个方案标了的，分组状态记为 ignored、不报警。
     """
     now = now or time.time()
+    params = {**DEFAULT_PARAMS, **(params or {})}
+    rules = db.data_rules(conn, tool)
     windows = [_build_window(conn, tool, inst, now) for inst in instances_for(conn, tool)]
     _fill_plans(windows)
+    for w in windows:
+        w["excluded"] = w["key"] in rules["windows"]
     by_key = {}
     for w in windows:
         by_key.setdefault((w["scope"], w["window"], w["plan_type"]), []).append(w)
     groups = []
     for (scope, window, plan), ws in by_key.items():
-        group = _analyze_group(ws, now) if ws[0]["supported"] else {"status": "unsupported", "rates": []}
+        group = _analyze_group(ws, now, params) if ws[0]["supported"] else {"status": "unsupported", "rates": []}
+        if rules["plans"].get(plan, (None,))[0] == "ignore":
+            group["status"] = "ignored"
         group.update(tool=tool, scope=scope, window=window, plan_type=plan, window_seconds=ws[0]["window_seconds"],
                      last_seen=max(w["last_seen"] for w in ws), latest_end=max(w["end"] for w in ws),
                      windows_n=len(ws))
+        # 趋势图：近 60 天，加上断档前被拿来当基线的窗口
         group["trend"] = [{"start": w["start"], "end": w["end"], "last_seen": w["last_seen"], "value": w["value"],
                            "pct": w["used_percent"], "pct_clean": w["pct_clean"], "external_pct": w["external_pct"],
-                           "contaminated": w["contaminated"], "in_trend": w["in_trend"], "cost": w["cost_at_snapshot"]}
-                          for w in ws if w["value"] is not None and w["end"] >= now - ANALYSIS_DAYS * 86400]
+                           "contaminated": w["contaminated"], "in_trend": w["in_trend"], "cost": w["cost_at_snapshot"],
+                           "excluded": w["excluded"], "role": w["role"], "key": w["key"]}
+                          for w in ws if w["value"] is not None
+                          and (w["end"] >= now - ANALYSIS_DAYS * 86400 or w["role"] == "baseline")]
         groups.append(group)
     return {"windows": windows, "groups": groups}
 
