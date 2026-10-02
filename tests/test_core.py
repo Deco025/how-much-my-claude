@@ -641,6 +641,26 @@ class OpenSourceTest(TempDB):
         self.assertEqual((conns["claude"]["log_files"], conns["claude"]["credentials"]), (0, "missing"))
         self.assertNotIn("token", json.dumps(conns))
 
+    def test_demo_data_tells_its_story(self):
+        from quotalens import demo
+        from quotalens.service import Service
+        now = 1_790_900_000
+        demo.populate(now=now)
+        svc = Service(notify_desktop=False, demo=True)
+        with mock.patch.object(calibrate.time, "time", return_value=now), db.reader() as conn:
+            groups = {(tool, g["window"]): g for tool in ("codex", "claude")
+                      for g in calibrate.analyze(conn, tool, now)["groups"]}
+            claude_windows = calibrate.analyze(conn, "claude", now)["windows"]
+            codex_windows = calibrate.analyze(conn, "codex", now)["windows"]
+        self.assertEqual(groups[("codex", "five_hour")]["status"], "tighter")   # 演示的主角：收紧了 30%
+        self.assertAlmostEqual(groups[("codex", "five_hour")]["ratio"], 0.7, delta=0.1)
+        self.assertEqual(groups[("codex", "seven_day")]["status"], "stable")
+        self.assertNotIn(groups[("claude", "five_hour")]["status"], ("tighter", "looser"))
+        self.assertTrue(any(w["external_pct"] >= 10 for w in claude_windows))  # 网页聊天被识别成外部消耗
+        self.assertLess(max(w["external_pct"] for w in codex_windows), 3)      # Codex 没有外部消耗，不能误报
+        svc.start()  # 演示模式不起后台线程、不联网
+        self.assertEqual({c["credentials"] for c in svc.connections()}, {"ok"})
+
     def test_events_carry_raw_params(self):
         with db.writer() as conn:
             conn.execute("INSERT INTO quota_snapshot VALUES ('codex', 'codex', 'seven_day', 1000, 5, 700000, 604800, 'free', 'log')")

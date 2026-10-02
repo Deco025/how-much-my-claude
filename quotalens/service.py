@@ -30,8 +30,12 @@ WINDOW_NAMES = {"five_hour": "5 小时窗口", "seven_day": "每周窗口", "thi
 
 
 class Service:
-    def __init__(self, claude_poll_minutes=None, history_days=None, notify_desktop=None):
-        """参数是命令行给的临时覆盖（不保存）；没给的用页面「设置」里存的值。"""
+    def __init__(self, claude_poll_minutes=None, history_days=None, notify_desktop=None, demo=False):
+        """参数是命令行给的临时覆盖（不保存）；没给的用页面「设置」里存的值。
+
+        demo=True 是演示模式：数据库里已经是生成好的演示数据，不扫日志、不查额度、不刷新价格、不联网。
+        """
+        self.demo = demo
         db.init_db()
         self.prices = PriceTable()
         self._overrides = {k: v for k, v in (("claude_poll_minutes", claude_poll_minutes),
@@ -241,6 +245,8 @@ class Service:
 
     def sync_now(self):
         """页面上的「立即同步」：重载价格覆盖、扫日志、查两边额度、重算分析。"""
+        if self.demo:
+            return self.analysis(refresh=True)
         self.prices.reload()
         self.reprice_if_needed()
         self.scan_logs()
@@ -273,7 +279,34 @@ class Service:
             self._stop.wait(SCAN_INTERVAL)
 
     def start(self):
+        if self.demo:
+            # 演示模式不跑后台任务；状态填成「刚同步过、两边都正常」，页面才不会一直等第一次同步
+            now = time.time()
+            self.status.update(last_scan=now, claude_quota={"status": "ok", "at": now, "plan": "pro"},
+                               codex_quota={"status": "ok", "at": now, "plan": "plus"})
+            return
         threading.Thread(target=self.run_forever, name="quotalens-worker", daemon=True).start()
+
+    def connections(self):
+        """两个工具的连接状态（页面顶部的提示、「运行状态」用）。不含 token。"""
+        from . import collect_claude, collect_codex, paths
+        if self.demo:
+            return [{"tool": tool, "log_dir": "demo", "log_files": 1, "credentials": "ok", "credentials_where": "demo",
+                     "last_poll": self.status.get(f"{tool}_quota")} for tool in TOOLS]
+        out = []
+        for tool, mod, quota in (("codex", collect_codex, codex_quota), ("claude", collect_claude, claude_quota)):
+            out.append({"tool": tool, "log_dir": str(paths.codex_dir() if tool == "codex" else paths.claude_dir()),
+                        "log_files": len(mod.log_files()), "credentials": quota.read_credentials()[-1],
+                        "credentials_where": quota.credentials_location(),
+                        "last_poll": self.status.get(f"{tool}_quota")})
+        return out
+
+    def claude_plan_and_credentials(self):
+        """(订阅方案, 登录状态)；演示模式不读真实的登录信息。"""
+        if self.demo:
+            return "pro", "ok"
+        _, plan, status = claude_quota.read_credentials()
+        return plan, status
 
     def stop(self):
         self._stop.set()

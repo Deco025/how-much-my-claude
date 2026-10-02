@@ -10,7 +10,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import calibrate, claude_quota, codex_quota, collect_claude, collect_codex, db, paths, pricing, settings, stats
+from . import calibrate, collect_claude, collect_codex, db, pricing, settings, stats
 from .paths import WEB_DIR
 from .service import Service
 
@@ -76,7 +76,7 @@ def create_app(service: Service, on_show=None, on_quit=None) -> FastAPI:
                 "plan": next((w["plan_type"] for w in current if w["plan_type"]), None),
                 "windows": [_current(w, _group_of(result, w)) for w in current],
             })
-        _, claude_plan, cred = claude_quota.read_credentials()
+        claude_plan, cred = service.claude_plan_and_credentials()
         for t in tools:
             if t["tool"] == "claude":
                 t["plan"] = t["plan"] or claude_plan
@@ -146,14 +146,7 @@ def create_app(service: Service, on_show=None, on_quit=None) -> FastAPI:
     @app.get("/api/connections")
     def connections():
         """两个工具各自：本机有没有它的日志、登录信息找不找得到、最近一次查额度的结果。不含 token。"""
-        out = []
-        for tool, mod, quota in (("codex", collect_codex, codex_quota), ("claude", collect_claude, claude_quota)):
-            files = mod.log_files()
-            out.append({"tool": tool, "log_dir": str(paths.codex_dir() if tool == "codex" else paths.claude_dir()),
-                        "log_files": len(files), "credentials": quota.read_credentials()[-1],
-                        "credentials_where": quota.credentials_location(),
-                        "last_poll": service.status.get(f"{tool}_quota")})
-        return out
+        return service.connections()
 
     # ── 数据管理 ────────────────────────────────────────
 

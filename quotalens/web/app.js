@@ -501,7 +501,7 @@ function drawTrend(node, g, events) {
   const short = xMax - xMin < 2 * 86400e3;
   const label = (v) => {
     const u = axis.unfold(v);
-    if (u.inGap) return "";
+    if (u.inGap || u.t > Date.now() + 3600e3) return "";  // 断档里、还没到的日期都不标
     const d = new Date(u.t);
     return short ? `${pad(d.getHours())}:${pad(d.getMinutes())}` : `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
   };
@@ -513,7 +513,8 @@ function drawTrend(node, g, events) {
     tooltip: { ...b.tooltip, trigger: "item",
       formatter: (it) => it.componentType === "markLine" || it.componentType === "markArea" ? esc(it.name) : tip(it.data[2]) },
     xAxis: { type: "value", min: axis.fold(xMin) - margin, max: axis.fold(xMax) + margin, ...b.axis, splitLine: { show: false },
-      axisLabel: { ...b.axis.axisLabel, formatter: label } },
+      // 两端是留白处，标签会和旁边的挤在一起、或者显示成还没到的日期，不标
+      axisLabel: { ...b.axis.axisLabel, formatter: label, showMinLabel: false, showMaxLabel: false } },
     yAxis: { type: "value", min: +lo.toFixed(2), max: +hi.toFixed(2), splitNumber: 3, ...b.axis, axisLine: { show: false },
       axisLabel: { ...b.axis.axisLabel, formatter: (v) => "$" + Math.round(v) } },
     series: [
