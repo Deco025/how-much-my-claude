@@ -1,14 +1,53 @@
+<div align="center">
+
+<img src="quotalens/web/icon.png" width="88" alt="">
+
 # How much my Claude
 
-[中文](README.md)
+**What is one quota window of your Claude / Codex subscription actually worth — and did it just get smaller?**
 
-Turns your Codex / Claude Code subscription usage into API-equivalent dollars, estimates what each quota window (5-hour, weekly) is worth, and watches whether the vendor quietly changes the quota.
+Turns your Codex CLI and Claude Code subscription usage into API-equivalent dollars,<br>works out what each 5-hour and weekly window is worth, and watches for silent quota changes.
 
-- **Local only**: it reads the logs that Codex CLI and Claude Code leave on your computer. Data stays on your machine and is never uploaded.
-- **No separate sign-in**: quota is checked with the login those CLIs already saved, sent only to the official endpoints, never refreshed or modified.
-- Desktop window + system tray, or just a browser page. Chinese and English UI.
+[![test](https://github.com/Deco025/quota-lens/actions/workflows/test.yml/badge.svg)](https://github.com/Deco025/quota-lens/actions/workflows/test.yml)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776ab)
+![Windows | macOS | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555)
+[![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f)](LICENSE)
+
+[中文](README.md) · [Install](#install) · [How changes are detected](#how-changes-are-detected) · [Privacy](#privacy-and-security)
+
+</div>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-en-dark.png">
+  <img alt="How much my Claude: Codex's 5-hour quota flagged as possibly tightened" src="docs/images/hero-en-light.png">
+</picture>
+
+<p align="center"><sub>The screenshot uses made-up demo data: Codex's 5-hour quota was quietly tightened 3 days ago, and the tool caught it. Try it: <code>how-much-my-claude-server --demo --open</code></sub></p>
+
+## What it tells you
+
+- **What a window is worth**: how many dollars of API usage each 5-hour and weekly window holds, down to each model — the same $1 can use up very different amounts of quota on different models.
+- **Whether the quota changed**: every window is measured with the same ruler; when recent windows fall outside normal noise you get a banner and a system notification. A rubber stamp and a deviation gauge make the verdict obvious.
+- **Whether it will last**: a pixel progress bar shows what you've used, where you'll be at reset at the current pace, and how much of the window's time has passed; running out early turns it red.
+- **Not fooled by noise**: usage your local logs can't see (other devices, web chat) is detected and removed; coming back after a break compares across the gap; switching main models is reported honestly as "can't compare yet".
+- **Fully local**: it only reads local logs — no separate sign-in, no uploads, no telemetry. Data is kept forever, and you decide what to keep or delete.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/more-en-dark.png">
+  <img alt="Per-model rates and usage" src="docs/images/more-en-light.png">
+</picture>
 
 > Not affiliated with Anthropic or OpenAI. The quota endpoints are unofficial ones the official CLIs use themselves; they may change or stop working at any time.
+
+## Try the demo
+
+No account needed — run it on made-up data first:
+
+```bash
+how-much-my-claude-server --demo --open
+```
+
+Demo data lives in a temporary folder; it doesn't read your logs, check any quota or touch the network. From source: `python run.py --demo --open`.
 
 ## Install
 

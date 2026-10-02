@@ -1,14 +1,53 @@
+<div align="center">
+
+<img src="quotalens/web/icon.png" width="88" alt="">
+
 # How much my Claude
 
-[English](README.en.md)
+**你的 Claude / Codex 订阅，一个额度窗口到底值多少钱？额度有没有被悄悄调小？**
 
-把 Codex / Claude Code 订阅的实际用量，按官方 API 价折算成美元，推算每个额度窗口（5 小时、每周）值多少钱，并监控厂商有没有悄悄调整额度。
+把 Codex CLI、Claude Code 的订阅用量按官方 API 价折算成美元，<br>算出每个 5 小时、每周窗口值多少钱，并盯着厂商有没有暗调额度。
 
-- **本地运行**：只读本机上 Codex CLI、Claude Code 留下的日志，数据存在你自己电脑上，不上传任何地方。
-- **不用单独登录**：直接用这两个命令行工具已经存好的登录信息查额度，只发往官方接口，从不刷新或改动它。
-- 桌面窗口 + 系统托盘，也可以只开浏览器版。界面支持中文和英文。
+[![test](https://github.com/Deco025/quota-lens/actions/workflows/test.yml/badge.svg)](https://github.com/Deco025/quota-lens/actions/workflows/test.yml)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776ab)
+![Windows | macOS | Linux](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555)
+[![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f)](LICENSE)
+
+[English](README.en.md) · [安装](#安装) · [怎么判断有没有被调](#怎么判断有没有被调) · [隐私与安全](#隐私与安全)
+
+</div>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-zh-dark.png">
+  <img alt="How much my Claude 界面：Codex 的 5 小时额度被标为疑似收紧" src="docs/images/hero-zh-light.png">
+</picture>
+
+<p align="center"><sub>截图是演示模式里的虚构数据：最近 3 天 Codex 的 5 小时额度被悄悄收紧，工具标了出来。自己跑一下：<code>how-much-my-claude-server --demo --open</code></sub></p>
+
+## 它能告诉你什么
+
+- **一个窗口值多少钱**：5 小时、每周窗口各自折合多少美元的 API 用量，还能拆到每个模型——同样花 $1，不同模型吃掉的额度可以差好几倍。
+- **额度有没有被调**：每个窗口都折算成同一把尺子，最近几个窗口偏出正常波动就报警，页面横幅加系统通知。检验章 + 偏离仪，一眼看出结论。
+- **还够不够用**：像素格进度条同时画出已用、照这个速度到重置会用到哪、窗口时间走到哪；预计提前用完会标红。
+- **不被干扰带偏**：自动识别别的设备、网页聊天这类本地看不到的消耗；停用一段时间再回来会跨断档对比；换了主力模型会如实说「这次没法比」。
+- **完全本地**：只读本机日志，不单独登录、不上传数据、没有统计上报。数据永久保存，要留要删你说了算。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/more-zh-dark.png">
+  <img alt="单模型汇率和用量统计" src="docs/images/more-zh-light.png">
+</picture>
 
 > 本项目与 Anthropic、OpenAI 没有任何关联。额度接口是官方 CLI 自己在用的非公开接口，随时可能变化或失效。
+
+## 先看看效果
+
+装好后不用任何账号，先用演示数据跑一下：
+
+```bash
+how-much-my-claude-server --demo --open
+```
+
+演示数据放在临时目录，不读你的日志、不查额度、不联网。从源码运行是 `python run.py --demo --open`。
 
 ## 安装
 
@@ -166,13 +205,15 @@ quotalens/
   settings.py        页面「设置」里的选项
   paths.py           数据目录、旧数据迁移
   desktop.py         桌面版：原生窗口 + 系统托盘，单实例
-  server.py          浏览器版
+  server.py          浏览器版（--demo 演示模式）
+  demo.py            演示数据生成
   install.py         快捷方式与开机自启（Windows / macOS / Linux）
   notify.py          系统通知（Windows / macOS / Linux）
   i18n.py            托盘、通知等后端文字的英文
   web/               页面（ECharts 已打包在 vendor/）
 desktop.pyw / run.py / install.py   从源码运行时的入口
 tools/               图标生成、翻译检查
+docs/images/         README 截图（演示模式下截的）
 ```
 
 ## 许可
