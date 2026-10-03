@@ -10,7 +10,8 @@ import threading
 import time
 import traceback
 
-from . import calibrate, claude_quota, codex_quota, collect_claude, collect_codex, db, events, i18n, notify, settings
+from . import (account, calibrate, claude_quota, codex_quota, collect_claude, collect_codex, db, events, i18n,
+               notify, settings)
 from .i18n import tr
 from .pricing import PriceTable, refresh_from_models_dev
 
@@ -92,8 +93,56 @@ class Service:
                         changed = True
                 except Exception as e:  # noqa: BLE001 — 单个来源失败不影响另一个
                     self._error(f"扫描 {name} 日志", e)
+            changed |= self._note_accounts()
             self.status["last_scan"] = time.time()
         return changed
+
+    def _note_accounts(self):
+        """记下本机当前登录的账号（只在变化时写一条）。换了账号要重算：旧声明不再适用。"""
+        if self.demo:
+            return False
+        changed = False
+        with db.writer() as conn:
+            for tool in TOOLS:
+                acct = account.current(tool)
+                if acct and acct != db.latest_account(conn, tool):
+                    db.note_account(conn, tool, time.time(), acct)
+                    changed = True
+        return changed
+
+    # ── 覆盖声明 ────────────────────────────────────────
+
+    def coverage(self):
+        """每个工具：当前账号能否识别、声明是否对当前账号生效、历史声明。账号只给出是否为当前账号，不给摘要。"""
+        out = {}
+        with db.reader() as conn:
+            for tool in TOOLS:
+                current = db.latest_account(conn, tool) if self.demo else account.current(tool)
+                claims = db.coverage_claims(conn, tool)
+                active = next((c for c in claims if c["end"] is None), None)
+                out[tool] = {
+                    "account_known": current is not None,
+                    "on": bool(active and active["account"] == current),
+                    # 有未结束的声明，但属于别的账号：切换过账号，需要重新确认
+                    "other_account": bool(active and active["account"] != current),
+                    "since": active["start"] if active else None,
+                    "history": [{"start": c["start"], "end": c["end"], "current_account": c["account"] == current}
+                                for c in claims],
+                }
+        return out
+
+    def set_coverage(self, tool, on):
+        """打开或关闭覆盖声明。打开时绑定当前账号、从现在起生效；读不到账号时拒绝。"""
+        with db.writer() as conn:
+            current = db.latest_account(conn, tool) if self.demo else account.current(tool)
+            if on and not current:
+                raise ValueError("account unknown")
+            now = time.time()
+            if current:
+                db.note_account(conn, tool, now, current)
+            db.set_coverage_claim(conn, tool, current, on, now=now)
+        self.analysis(refresh=True)
+        return self.coverage()
 
     def _due(self, key, interval, now):
         return now - self._last[key] >= interval
@@ -111,10 +160,10 @@ class Service:
         return self._record_poll("claude_quota", result)
 
     def _record_poll(self, key, result):
-        """记下轮询结果；只有百分比真的变了才算「有变化」，避免每次轮询都重算整套分析。"""
+        """记下轮询结果；百分比、重置时间或来源分项真的变了才算「有变化」，避免每次轮询都重算整套分析。"""
         previous = (self.status.get(key) or {}).get("percents")
         self.status[key] = result
-        return result["status"] == "ok" and result.get("percents") != previous
+        return result["status"] == "ok" and (result.get("percents") != previous or bool(result.get("breakdown_changed")))
 
     def poll_codex(self, force=False):
         """只在本地空闲时查：使用中日志已经带着额度信息。"""
@@ -159,6 +208,10 @@ class Service:
             for g in result["groups"]:
                 if g.get("status") not in ("tighter", "looser"):
                     continue
+                # 入库前再查一次资格：必须是当前算法版本、基线和待检测窗口都满足估值条件的结论。
+                # 旧分析结果或以后的改动不能绕过这里写出「收紧」记录
+                if not g.get("eligible") or g.get("analysis_version") != calibrate.ANALYSIS_VERSION:
+                    continue
                 key = f"{g['scope']}:{g['window']}:{g['plan_type']}"
                 with db.writer() as conn:
                     recent = conn.execute(
@@ -177,8 +230,10 @@ class Service:
                     if g.get("cross_gap"):
                         detail += tr("（跨断档：和 {day} 之前的窗口比）",
                                      day=time.strftime("%m-%d", time.localtime(g["baseline_to"])))
-                    conn.execute("INSERT INTO alert (ts, tool, window, direction, ratio, detail) VALUES (?, ?, ?, ?, ?, ?)",
-                                 (now, tool, key, g["status"], g["ratio"], f"{title}。{detail}"))
+                    conn.execute("INSERT INTO alert (ts, tool, window, direction, ratio, detail, analysis_version)"
+                                 " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                 (now, tool, key, g["status"], g["ratio"], f"{title}。{detail}",
+                                  calibrate.ANALYSIS_VERSION))
                 out.append((title, detail))
         return out
 

@@ -535,3 +535,30 @@ code { font-family: var(--mono); font-size: 12px; word-break: break-all; }
 .settings input[type="number"], .settings select { font: inherit; font-size: 13px; padding: 3px 8px; width: 110px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-1); color: var(--text-primary); }
 .settings input[type="checkbox"] { width: 16px; height: 16px; }
 .settings-actions { display: flex; gap: 12px; align-items: center; }
+
+/* 估值条件：不满足时只显示状态和原因，不显示容量估值 */
+.fact.quality { font-size: 12px; color: var(--text-muted); cursor: help; }
+.fact.quality.incomplete, .fact.quality.source_unknown { color: var(--warning-text); }
+.fact.muted { font-size: 12px; color: var(--text-muted); }
+.stamp.not_eligible { color: var(--text-muted); border-style: dashed; box-shadow: none; }
+
+/* Claude 周窗口：已用部分来源 */
+.sources { margin-top: 8px; font-size: 12px; color: var(--text-secondary); }
+.sources summary { cursor: pointer; }
+.sources ul { list-style: none; margin: 6px 0 4px; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.sources li { display: inline-flex; gap: 6px; }
+.sources li strong { font-family: var(--mono); color: var(--text-primary); }
+
+/* 窗口详情：估值条件和原因 */
+.detail-quality { font-size: 13px; color: var(--text-secondary); margin-bottom: 8px; }
+.detail-quality:empty { display: none; }
+.detail-quality ul { margin: 4px 0 0; padding-left: 18px; }
+.quality.incomplete, .quality.source_unknown { color: var(--warning-text); }
+
+/* 设置：覆盖声明 */
+.coverage { display: grid; gap: 12px; max-width: 640px; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--grid); }
+.coverage h3, .coverage p { margin: 0; }
+.coverage p { font-size: 12px; }
+.coverage .field { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; align-items: center; font-size: 13px; }
+.coverage .field small { grid-column: 1 / -1; color: var(--text-muted); font-size: 12px; }
+.coverage input[type="checkbox"] { width: 16px; height: 16px; }

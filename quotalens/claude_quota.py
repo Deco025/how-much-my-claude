@@ -15,7 +15,7 @@ import time
 import urllib.error
 import urllib.request
 
-from . import db
+from . import account, db
 from .paths import claude_dir
 from .util import WINDOW_SECONDS, parse_ts
 
@@ -69,8 +69,81 @@ def read_credentials():
     return token, plan, "ok"
 
 
+BREAKDOWN_KEY = "seven_day_breakdown"
+COLLECTED_SOURCES = {"claude_code"}           # 本项目能采集到的来源（但分不出是哪台设备）
+KNOWN_SOURCES = {"claude_code", "chat", "cowork", "other"}
+
+
+def parse_breakdown(body: dict):
+    """周额度来源分项 → {"as_of", "window_start", "rows", "issues"}；接口没给分项时返回 None。
+
+    只校验、不修正：非有限数值、越界百分比记为无法解析（percent=None），重复 key 只保留第一个并记下问题，
+    合计偏离 100 超过取整误差也记下问题。未知新产品原样保留。空列表保留为一个无法解析的占位行。
+    """
+    raw = body.get(BREAKDOWN_KEY)
+    if raw is None:
+        return None
+    issues = []
+    if not isinstance(raw, dict):
+        return {"as_of": None, "window_start": None, "rows": [{"key": "_invalid", "display_name": None, "percent": None}],
+                "issues": ["not_object"]}
+    rows, keys = [], set()
+    items = raw.get("rows")
+    if not isinstance(items, list):
+        issues.append("rows_missing")
+        items = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("key"), str) or not item["key"]:
+            issues.append("bad_row")
+            continue
+        key = item["key"]
+        if key in keys:
+            issues.append("duplicate_key")
+            continue
+        keys.add(key)
+        pct = item.get("percent")
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)) or pct != pct or pct in (float("inf"), float("-inf")) \
+                or not 0 <= pct <= 100:
+            issues.append("bad_percent")
+            pct = None
+        name = item.get("display_name")
+        rows.append({"key": key, "display_name": name if isinstance(name, str) else None,
+                     "percent": float(pct) if pct is not None else None})
+    if not rows:
+        issues.append("empty")
+        rows.append({"key": "_empty", "display_name": None, "percent": None})
+    valid = [r["percent"] for r in rows if r["percent"] is not None]
+    if valid and abs(sum(valid) - 100) > 0.5 * len(rows) + 1e-9:
+        issues.append("sum_mismatch")
+    return {"as_of": parse_ts(raw.get("as_of")), "window_start": parse_ts(raw.get("window_started_at")),
+            "rows": rows, "issues": issues}
+
+
+def store_breakdown(conn, breakdown, fetched_at) -> bool:
+    """存一组分项（as_of 缺失时用抓取时刻）。返回是否是新的一组。"""
+    return db.save_breakdown(conn, "claude", "seven_day", breakdown["as_of"] or fetched_at,
+                             breakdown["window_start"], breakdown["rows"], now=fetched_at,
+                             issues=breakdown.get("issues") or ())
+
+
+def backfill_breakdowns(conn) -> int:
+    """从归档的原始响应里补出历史分项（不重新请求接口）。返回新补的组数。"""
+    n = 0
+    for r in conn.execute("SELECT first_ts, body FROM raw_response WHERE tool = 'claude' ORDER BY first_ts").fetchall():
+        try:
+            body = json.loads(r["body"])
+        except ValueError:
+            continue
+        breakdown = parse_breakdown(body) if isinstance(body, dict) else None
+        if breakdown and store_breakdown(conn, breakdown, r["first_ts"]):
+            n += 1
+    return n
+
+
 def _classify(key: str):
-    """接口顶层键名 → (scope, window)。"""
+    """接口顶层键名 → (scope, window)。来源分项不是额度窗口，显式排除。"""
+    if key == BREAKDOWN_KEY:
+        return None
     if key in WINDOW_SECONDS:
         return "all", key
     for window in WINDOW_SECONDS:
@@ -123,11 +196,17 @@ def poll(timeout=15) -> dict:
         result["status"], result["error"] = "error", str(e)
         return result
     rows = parse_usage(body, result["at"], plan)
+    breakdown = parse_breakdown(body)
     with db.writer() as conn:
         conn.executemany(INSERT_SNAPSHOT, rows)
         db.archive_response(conn, "claude", result["at"], body)
+        db.note_account(conn, "claude", result["at"], account.claude_account())
+        if breakdown:
+            result["breakdown_changed"] = store_breakdown(conn, breakdown, result["at"])
     result["windows"] = len(rows)
-    result["percents"] = {f"{scope}:{window}": pct for scope, window, _, pct, *_ in rows}
+    # 百分比和重置时间：任何一个变了，分析缓存都要更新（提前重置时百分比可能不变）
+    # 重置时间每次查询都有亚秒级漂移：取整到分钟再比较，否则每次轮询都算「有变化」
+    result["percents"] = {f"{scope}:{window}": [pct, db.round_reset(resets)] for scope, window, _, pct, resets, *_ in rows}
     extra = body.get("extra_usage")
     if isinstance(extra, dict) and extra.get("is_enabled"):
         result["extra_usage"] = {k: extra.get(k) for k in ("used_credits", "monthly_limit", "currency")}

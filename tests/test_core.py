@@ -11,7 +11,14 @@ from quotalens import calibrate, claude_quota, codex_quota, collect_claude, coll
 
 
 class TempDB(unittest.TestCase):
-    """每个用例一个独立的临时数据库。"""
+    """每个用例一个独立的临时数据库。CLAIMED = True 时两个工具都有从 0 时刻起生效的覆盖声明。"""
+    CLAIMED = False
+
+    def claim(self, tool, start=0.0, account="acct", end=None):
+        with db.writer() as conn:
+            db.note_account(conn, tool, start, account)
+            conn.execute("INSERT INTO coverage_claim (tool, account, start, end) VALUES (?, ?, ?, ?)",
+                         (tool, account, start, end))
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -21,6 +28,9 @@ class TempDB(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         db.init_db()
+        if self.CLAIMED:
+            for tool in ("codex", "claude"):
+                self.claim(tool)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -115,6 +125,8 @@ class CodexParseTest(unittest.TestCase):
 
 
 class CodexSyncTest(TempDB):
+    CLAIMED = True
+
     def test_sync_links_and_estimate(self):
         home = Path(self.tmp.name) / "codex"
         f = home / "sessions" / "2026" / "09" / "30" / "rollout-a.jsonl"
@@ -141,6 +153,8 @@ class CodexSyncTest(TempDB):
 
 
 class CalibrateTest(TempDB):
+    CLAIMED = True
+
     def add(self, conn, uid, tool, ts, model, cost, link=None):
         conn.execute("INSERT INTO usage (id, tool, ts, model, on_plan, cost_usd) VALUES (?, ?, ?, ?, 1, ?)",
                      (uid, tool, ts, model, cost))
@@ -150,6 +164,12 @@ class CalibrateTest(TempDB):
     def snap(self, conn, tool, scope, window, ts, pct, resets, seconds, plan="plus"):
         conn.execute("INSERT INTO quota_snapshot VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'test')",
                      (tool, scope, window, ts, pct, resets, seconds, plan))
+
+    def breakdown(self, conn, as_of, window_start=None, **pcts):
+        """一组 Claude 周来源分项；默认全部来自 Claude Code。"""
+        pcts = pcts or {"claude_code": 100}
+        db.save_breakdown(conn, "claude", "seven_day", as_of, window_start,
+                          [{"key": k, "display_name": k, "percent": v} for k, v in pcts.items()])
 
     def codex_window(self, conn, name, start, steps, model="a"):
         """一个 Codex 5 小时窗口；steps 是 [(本地花费, 百分比涨幅)]，花费为 0 表示空闲时的接口快照。"""
@@ -168,19 +188,23 @@ class CalibrateTest(TempDB):
     def test_time_mode_ratio_and_early_reset(self):
         # 第一个周窗口用到 $120 / 60% 后提前重置；新窗口的花费只从交界处开始算
         with db.writer() as conn:
-            self.add(conn, "a", "claude", 1000, "claude-opus-5-5", 120.0)
-            self.add(conn, "x", "claude", 1500, "deepseek-flash", None)  # 第三方，不计入
+            # 第一个窗口从 T 开始，T 晚于声明生效时间（0）
+            T = 10_000
+            self.add(conn, "a", "claude", T + 1000, "claude-opus-5-5", 120.0)
+            self.add(conn, "x", "claude", T + 1500, "deepseek-flash", None)  # 第三方，不计入
             conn.execute("UPDATE usage SET on_plan = 0 WHERE id = 'x'")
-            self.snap(conn, "claude", "all", "seven_day", 2000, 60.0, 600_000, 604800)
-            self.add(conn, "b", "claude", 3000, "claude-opus-5-5", 30.0)
-            self.snap(conn, "claude", "all", "seven_day", 4000, 15.0, 2500 + 604800, 604800)
-        first, second = self.analyze("claude", 5000)["windows"]
+            self.snap(conn, "claude", "all", "seven_day", T + 2000, 60.0, T + 604800, 604800)
+            self.breakdown(conn, T + 2000, T)
+            self.add(conn, "b", "claude", T + 3000, "claude-opus-5-5", 30.0)
+            self.snap(conn, "claude", "all", "seven_day", T + 4000, 15.0, T + 2500 + 604800, 604800)
+            self.breakdown(conn, T + 4000, T + 2500)
+        first, second = self.analyze("claude", T + 5000)["windows"]
         self.assertAlmostEqual(first["cap"], 200.0)   # $120 / 60%
         self.assertEqual(first["confidence"], "high")
         self.assertAlmostEqual(second["cap"], 200.0)  # $30 / 15%，不含第一个窗口的 $120
         self.assertEqual(second["confidence"], "medium")
         with db.reader() as conn:
-            kinds = [e["kind"] for e in events.detect(conn, now=5000)]
+            kinds = [e["kind"] for e in events.detect(conn, now=T + 5000)]
         self.assertIn("reset", kinds)
 
     def test_current_windows_drop_other_account(self):
@@ -209,16 +233,40 @@ class CalibrateTest(TempDB):
         self.assertAlmostEqual(caps["b"], 25, delta=3)
         self.assertEqual(group["ref_model"], "a")  # 花费最多的模型当主力
 
-    def test_external_jump_is_removed(self):
+    def test_suspect_jump_is_flagged_not_deducted(self):
         # 每 $0.2 涨 2%（窗口值 $10），中间有一次本地只花 $0.01 却涨了 30%，另有一次空闲时涨 4%
         steps = [(0.2, 2)] * 5 + [(0.01, 30)] + [(0.2, 2)] * 5 + [(0, 4)]
         with db.writer() as conn:
             self.codex_window(conn, "w", 1_000_000, steps)
         w = self.analyze("codex", 1_020_000)["windows"][0]
         self.assertAlmostEqual(w["used_percent"], 54)
-        self.assertAlmostEqual(w["external_pct"], 34, delta=0.5)
+        self.assertAlmostEqual(w["pct_clean"], 54)               # 不扣
+        self.assertAlmostEqual(w["external_pct"], 34, delta=0.5)  # 只标记为疑点
         self.assertTrue(w["contaminated"])
-        self.assertAlmostEqual(w["cap"], 10.0, delta=0.5)  # $2.01 / 约 20%
+        self.assertAlmostEqual(w["cost_at_snapshot"] / w["used_percent"] * 100, 2.01 / 0.54, delta=0.05)  # 按原始已用%
+        self.assertEqual(w["quality"], "unconfirmed")             # 有疑点：不作条件估计
+        self.assertIsNone(w["cap"])                               # 也就不给容量数字
+        self.assertIn("suspect_unrecorded", [r["code"] for r in w["reasons"]])
+
+    def same_spend_two_readings(self):
+        """之前几个窗口都是每 $2 涨 5%（值 $40）；最后一个窗口同一笔 $8，额度先 10%、后 20%（第二次没新花费）。"""
+        with db.writer() as conn:
+            for k in range(4):
+                self.codex_window(conn, f"h{k}", 1_000_000 + k * 20_000, [(2.0, 5)] * 4)
+            start = 1_000_000 + 4 * 20_000
+            reset = start + 18000
+            self.add(conn, "u", "codex", start + 10, "a", 8.0, ("codex", "five_hour", reset))
+            self.snap(conn, "codex", "codex", "five_hour", start + 60, 10, reset, 18000)
+            self.snap(conn, "codex", "codex", "five_hour", start + 3600, 20, reset, 18000)
+        return max(self.analyze("codex", start + 4000)["windows"], key=lambda w: w["start"])
+
+    def test_same_spend_two_readings_not_deducted(self):
+        w = self.same_spend_two_readings()
+        self.assertEqual(w["pct_clean"], 20)
+        self.assertAlmostEqual(w["external_pct"], 0, delta=0.5)   # 合起来符合预期：只是额度更新滞后
+        self.assertAlmostEqual(w["cap"], 40.0)
+        self.assertEqual(w["quality"], "conditional")
+        self.assertTrue(w["claimed"])
 
     def test_change_detection(self):
         now = 50 * 86400
@@ -387,11 +435,27 @@ class ReviewFixesTest(TempDB):
         from quotalens.service import Service
         svc = Service(notify_desktop=False)
         group = {"status": "tighter", "scope": "codex", "window": "five_hour", "plan_type": "plus", "ratio": 0.6,
-                 "recent_n": 4, "baseline_n": 8, "ref_model": "a", "recent_median": 6.0, "baseline_median": 10.0}
+                 "recent_n": 4, "baseline_n": 8, "ref_model": "a", "recent_median": 6.0, "baseline_median": 10.0,
+                 "eligible": True, "analysis_version": calibrate.ANALYSIS_VERSION}
         analysis = {"at": 1000.0, "tools": {"codex": {"groups": [group]}}}
         self.assertEqual(len(svc._record_alerts(analysis)), 1)
         self.assertEqual(svc._record_alerts({**analysis, "at": 2000.0}), [])
         self.assertEqual(len(svc._record_alerts({**analysis, "at": 1000.0 + 25 * 3600})), 1)
+        with db.reader() as conn:
+            self.assertEqual({r[0] for r in conn.execute("SELECT analysis_version FROM alert")},
+                             {calibrate.ANALYSIS_VERSION})
+
+    def test_alert_gate_rejects_ineligible_or_old_results(self):
+        # 趋势本应判为收紧，但不满足资格（或来自旧算法）：不入库、不提醒
+        from quotalens.service import Service
+        svc = Service(notify_desktop=False)
+        base = {"status": "tighter", "scope": "codex", "window": "five_hour", "plan_type": "plus", "ratio": 0.6,
+                "recent_n": 4, "baseline_n": 8, "ref_model": "a", "recent_median": 6.0, "baseline_median": 10.0}
+        for group in ({**base}, {**base, "eligible": False, "analysis_version": calibrate.ANALYSIS_VERSION},
+                      {**base, "eligible": True, "analysis_version": 1}):
+            self.assertEqual(svc._record_alerts({"at": 1000.0, "tools": {"codex": {"groups": [group]}}}), [])
+        with db.reader() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM alert").fetchone()[0], 0)
 
     def test_claude_sync_waits_for_partial_line(self):
         def line(msg_id, output):
@@ -457,6 +521,8 @@ class ReviewFixesTest(TempDB):
 
 
 class LongTermTest(TempDB):
+    CLAIMED = True
+
     """断档后续上、模型换代、用户对数据的选择（不参与分析 / 删除）。"""
 
     add, snap, codex_window, analyze = CalibrateTest.add, CalibrateTest.snap, CalibrateTest.codex_window, CalibrateTest.analyze
@@ -656,8 +722,16 @@ class OpenSourceTest(TempDB):
         self.assertAlmostEqual(groups[("codex", "five_hour")]["ratio"], 0.7, delta=0.1)
         self.assertEqual(groups[("codex", "seven_day")]["status"], "stable")
         self.assertNotIn(groups[("claude", "five_hour")]["status"], ("tighter", "looser"))
-        self.assertTrue(any(w["external_pct"] >= 10 for w in claude_windows))  # 网页聊天被识别成外部消耗
-        self.assertLess(max(w["external_pct"] for w in codex_windows), 3)      # Codex 没有外部消耗，不能误报
+        # 网页聊天：周分项里出现 Chats，那一周和重叠的 5 小时窗口采集不完整；不扣已用%
+        chat_weeks = [w for w in claude_windows if w["window"] == "seven_day" and w["quality"] == "incomplete"]
+        self.assertEqual(len(chat_weeks), 1)
+        self.assertIn("uncollected_sources", [r["code"] for r in chat_weeks[0]["reasons"]])
+        self.assertIn("claim_conflict", [r["code"] for r in chat_weeks[0]["reasons"]])
+        chat_5h = [w for w in claude_windows if w["window"] == "five_hour" and w["quality"] == "incomplete"]
+        self.assertGreaterEqual(len(chat_5h), 1)
+        self.assertTrue(all(w["pct_clean"] == w["used_percent"] for w in claude_windows))
+        self.assertTrue(any(w["window"] == "five_hour" and w["quality"] == "conditional" for w in claude_windows))
+        self.assertLess(max(w["external_pct"] for w in codex_windows), 3)      # Codex 没有疑点，不能误报
         svc.start()  # 演示模式不起后台线程、不联网
         self.assertEqual({c["credentials"] for c in svc.connections()}, {"ok"})
 
@@ -667,6 +741,181 @@ class OpenSourceTest(TempDB):
             conn.execute("INSERT INTO quota_snapshot VALUES ('codex', 'codex', 'seven_day', 2000, 6, 700000, 604800, 'plus', 'log')")
             plan = [e for e in events.detect(conn, now=3000) if e["kind"] == "plan"][0]
         self.assertEqual(plan["params"], {"from": "free", "to": "plus"})
+
+
+class AcceptanceTest(TempDB):
+    """方案验收用例：默认未声明、声明边界、来源分项各档、陈旧分项、抖动去重、解析异常、旧库迁移。"""
+    add = CalibrateTest.add
+    snap = CalibrateTest.snap
+    breakdown = CalibrateTest.breakdown
+    T = 10_000
+
+    def week(self, as_of_offset=2000, last_snap_offset=2000, **pcts):
+        """一个从 T 开始的 Claude 周窗口：花 $120 用到 60%，在 as_of_offset 处给一组来源分项。"""
+        T = self.T
+        with db.writer() as conn:
+            self.add(conn, "a", "claude", T + 1000, "claude-opus-5-5", 120.0)
+            self.snap(conn, "claude", "all", "seven_day", T + 2000, 60.0, T + 604800, 604800)
+            if last_snap_offset != 2000:
+                self.snap(conn, "claude", "all", "seven_day", T + last_snap_offset, 60.0, T + 604800, 604800)
+            self.breakdown(conn, T + as_of_offset, T, **pcts)
+
+    def window(self, now=None):
+        with db.reader() as conn:
+            return calibrate.analyze(conn, "claude", now=now or self.T + 50_000)["windows"][0]
+
+    def codes(self, w):
+        return [r["code"] for r in w["reasons"]]
+
+    # 默认状态：没有声明
+    def test_default_no_claim_hides_capacity_everywhere(self):
+        self.week()
+        with db.reader() as conn:
+            result = calibrate.analyze(conn, "claude", now=self.T + 50_000)
+        w = result["windows"][0]
+        self.assertEqual(w["quality"], "unconfirmed")
+        self.assertIn("no_claim", self.codes(w))
+        self.assertIsNone(w["cap"])
+        self.assertIsNone(w["value"])
+        for g in result["groups"]:
+            self.assertFalse(g["eligible"])
+            self.assertIsNone(g["ref_cap"])
+            self.assertTrue(all(p["value"] is None for p in g["trend"]))
+        pub = calibrate.public(w)
+        for k in ("cap", "cap_low", "cap_high", "value"):
+            self.assertIsNone(pub.get(k))
+
+    # 声明边界
+    def test_claim_today_does_not_cover_earlier_window(self):
+        self.claim("claude", start=self.T + 100)
+        self.week()
+        w = self.window()
+        self.assertEqual(w["quality"], "unconfirmed")
+        self.assertIn("claim_after_start", self.codes(w))
+
+    def test_claim_of_other_account_does_not_apply(self):
+        self.claim("claude", start=0, account="old")
+        with db.writer() as conn:
+            db.note_account(conn, "claude", self.T - 10, "new")
+        self.week()
+        w = self.window()
+        self.assertEqual(w["quality"], "unconfirmed")
+        self.assertIn("claim_other_account", self.codes(w))
+
+    def test_window_spanning_account_switch(self):
+        self.claim("claude", start=0, account="a1")
+        with db.writer() as conn:
+            db.note_account(conn, "claude", self.T + 1500, "a2")
+        self.week()
+        self.assertIn("account_changed", self.codes(self.window()))
+
+    def test_claim_ended_before_window_end(self):
+        self.claim("claude", start=0, end=self.T + 1500)
+        self.week()
+        self.assertIn("claim_ended", self.codes(self.window()))
+
+    def test_switching_accounts_ends_old_claim(self):
+        self.claim("claude", start=0, account="a1")
+        with db.writer() as conn:
+            db.set_coverage_claim(conn, "claude", "a2", True, now=500)
+            claims = db.coverage_claims(conn, "claude")
+        old = [c for c in claims if c["account"] == "a1"][0]
+        self.assertIsNotNone(old["end"])
+        self.assertTrue(any(c["account"] == "a2" and c["end"] is None for c in claims))
+
+    # 方案中的来源分项验收行
+    def test_code_84_chats_7_cowork_9_is_incomplete(self):
+        self.claim("claude")
+        self.week(claude_code=84, chat=7, cowork=9)
+        w = self.window()
+        self.assertEqual(w["quality"], "incomplete")
+        self.assertIsNone(w["cap"])
+
+    def test_code_20_unknown_80_with_claim_is_source_unknown(self):
+        self.claim("claude")
+        self.week(claude_code=20, brand_new_product=80)
+        w = self.window()
+        self.assertEqual(w["quality"], "source_unknown")
+        self.assertIn("claim_conflict", self.codes(w))
+        self.assertIsNone(w["cap"])
+
+    def test_code_97_chats_3_is_conditional_with_bias(self):
+        self.claim("claude")
+        self.week(claude_code=97, chat=3)
+        w = self.window()
+        self.assertEqual(w["quality"], "conditional")
+        self.assertAlmostEqual(w["bias_pct"], 3)
+        self.assertAlmostEqual(w["cap"], 200.0)
+
+    def test_combined_noncode_share_blocks(self):
+        # 单看 Chats 3%、未知 3% 都不到 5%，但非 Code 合计 6% 到了
+        self.claim("claude")
+        self.week(claude_code=94, chat=3, other=3)
+        w = self.window()
+        self.assertEqual(w["quality"], "incomplete")
+        self.assertIn("uncollected_sources", self.codes(w))
+        self.assertIsNone(w["cap"])
+
+    def test_stale_breakdown_is_not_conditional(self):
+        # 分项停在第 2000 秒，但同一窗口最后一次快照在 5 天后
+        self.claim("claude")
+        self.week(last_snap_offset=5 * 86400)
+        w = self.window(now=self.T + 6 * 86400)
+        self.assertEqual(w["quality"], "unconfirmed")
+        self.assertIn("breakdown_stale", self.codes(w))
+
+    # 抖动与去重
+    def test_breakdown_jitter_does_not_add_rows(self):
+        rows = [{"key": "claude_code", "display_name": "Claude Code", "percent": 100}]
+        with db.writer() as conn:
+            first = db.save_breakdown(conn, "claude", "seven_day", 1000, 5000.0, rows)
+            again = db.save_breakdown(conn, "claude", "seven_day", 1300, 5000.4, rows)
+            n = conn.execute("SELECT COUNT(*) FROM source_breakdown").fetchone()[0]
+            last = db.breakdowns(conn, "claude")
+        self.assertTrue(first)
+        self.assertFalse(again)
+        self.assertEqual(n, 1)
+        self.assertEqual(last[-1]["last_as_of"], 1300)
+
+    # parse_breakdown 异常输入
+    def test_parse_breakdown_bad_inputs(self):
+        P = claude_quota.parse_breakdown
+        key = claude_quota.BREAKDOWN_KEY
+        self.assertIsNone(P({}))
+        self.assertIn("not_object", P({key: []})["issues"])
+        self.assertIn("empty", P({key: {"rows": []}})["issues"])
+        dup = P({key: {"rows": [{"key": "a", "percent": 50}, {"key": "a", "percent": 50}]}})
+        self.assertIn("duplicate_key", dup["issues"])
+        self.assertEqual(len(dup["rows"]), 1)
+        for bad in (float("nan"), "50", 150, True):
+            r = P({key: {"rows": [{"key": "a", "percent": bad}]}})
+            self.assertIsNone(r["rows"][0]["percent"])
+            self.assertIn("bad_percent", r["issues"])
+        self.assertIn("sum_mismatch", P({key: {"rows": [{"key": "a", "percent": 50}]}})["issues"])
+
+    def test_breakdown_issues_are_stored_and_block(self):
+        self.claim("claude")
+        rows = [{"key": "claude_code", "display_name": None, "percent": 50}]
+        with db.writer() as conn:
+            self.add(conn, "a", "claude", self.T + 1000, "claude-opus-5-5", 120.0)
+            self.snap(conn, "claude", "all", "seven_day", self.T + 2000, 60.0, self.T + 604800, 604800)
+            db.save_breakdown(conn, "claude", "seven_day", self.T + 2000, self.T, rows, issues=["sum_mismatch"])
+            stored = db.breakdowns(conn, "claude")
+        self.assertIn("sum_mismatch", stored[-1]["issues"])
+        self.assertNotEqual(self.window()["quality"], "conditional")
+
+    # 旧库迁移
+    def test_migration_adds_analysis_version(self):
+        with db.writer() as conn:
+            conn.execute("DROP TABLE alert")
+            conn.execute("CREATE TABLE alert (id INTEGER PRIMARY KEY, ts REAL, tool TEXT, scope TEXT, window TEXT,"
+                         " direction TEXT, ratio REAL, title TEXT, detail TEXT)")
+            conn.execute("INSERT INTO alert (ts, tool, scope, window, direction, ratio, title, detail)"
+                         " VALUES (1, 'codex', 'codex', 'five_hour', 'tighter', 0.5, 't', 'd')")
+        db.init_db()
+        with db.reader() as conn:
+            row = conn.execute("SELECT analysis_version FROM alert").fetchone()
+        self.assertEqual(row[0], 1)
 
 
 if __name__ == "__main__":

@@ -5,9 +5,12 @@
        Codex   按 usage_window 链接精确归属（日志里每次请求带着它所消耗窗口的 resets_at）。
        Claude  按时间 [resets_at - 窗口长度, resets_at]；前提是只登录一个账号、不用 API key 跑 claude-*。
   2. 拆步：相邻两次百分比上涨之间，本地各模型花了多少。
-  3. 外部消耗：用基线汇率算每步的预期涨幅，涨幅远超预期（或本地没花钱却涨了）的部分，
-     判为本地日志之外的消耗（别的设备、云任务、网页聊天），从已用% 里扣掉。
-     外部消耗占比高的窗口不参与汇率拟合和趋势。
+  3. 疑似未记录消耗：用汇率算每步的预期涨幅，涨幅远超预期（或本地没花钱却涨了）的步只标记为疑点，
+     不从已用% 里扣（可能是别处的使用，也可能只是日志和额度没对齐）。疑点多的窗口不参与校准和趋势。
+     首个快照之前的累计是「未分段」样本，不参与疑点检测。
+  3b. 估值条件：每个窗口给一个质量状态（见 QUALITY）。只有「可作条件估计」的窗口显示容量估值、
+     参与汇率拟合和趋势。它需要用户的覆盖声明（同一账号、窗口开始前已生效）、采集无缺口、
+     Claude 周来源分项里没有显著的其他来源。证据和声明冲突时以证据为准。
   4. 汇率：在干净窗口上做非负最小二乘  已用% ≈ Σ 汇率[模型] × 花费[模型]。
      实测额度消耗和 API 价格不成正比，不同模型同样花 $1 吃掉的额度可以差几倍。
   5. 趋势：每个窗口折算成「全用主力模型时，一个窗口值多少钱」，消除模型组合的影响。
@@ -45,7 +48,18 @@ EXTERNAL_MIN_STEP = 3    # 单步至少涨这么多 % 才可能判为外部消�
 EXTERNAL_FACTOR = 3      # 且超过预期涨幅的 3 倍再加 2 个点
 EXTERNAL_SLACK = 2
 IDLE_MIN_STEP = 2        # 本地完全没花钱时涨这么多 % 就算外部消耗
-CONTAMINATED_SHARE = 0.15
+CONTAMINATED_SHARE = 0.15  # 疑似未记录消耗占已用% 达到这个比例，窗口不参与校准和趋势
+ALIGN_SECONDS = 600        # 疑点出现在最近这么久内：可能只是日志和额度还没对齐
+
+# 来源分项（Claude 周窗口）：占已用部分的百分比，整数取整
+SOURCE_SHARE_LIMIT = 5.0   # 显著影响阈值（待回放验证的产品假设），按非 Code 合计的上限算
+BREAKDOWN_STALE = 2 * 3600  # 周分项比窗口最后一次快照早这么久：期间的来源说不清
+COLLECTED_SOURCES = {"claude_code"}   # 本项目能采集的来源（分不出设备）
+KNOWN_UNCOLLECTED = {"chat", "cowork"}  # 已知、但本项目采集不到的来源；其余（other、未知新产品）算来源不明
+
+# 窗口质量状态，严重的在前
+QUALITY = ["incomplete", "source_unknown", "aligning", "waiting", "unconfirmed", "conditional"]
+ANALYSIS_VERSION = 2       # 1 = 扣除推测的外部消耗；2 = 不扣除，加估值条件
 
 MIN_CHANGE = 0.20        # 低于这个幅度的变化不报（单窗口噪声约 ±20%）
 CHANGE_Z = 2.5
@@ -152,7 +166,8 @@ def _build_window(conn, tool, inst, now):
         pct = max(running, s["used_percent"])
         points.append({"ts": s["ts"], "pct": pct, "cost": cost})
         if pct > running:
-            steps.append({"ts": s["ts"], "dpct": pct - running, "vec": pending})
+            # 第一个快照就已经有用量：窗口起点到这里的累计没被分步观察过（未分段）
+            steps.append({"ts": s["ts"], "dpct": pct - running, "vec": pending, "unsegmented": not points[:-1]})
             pending, running = {}, pct
     cost_so_far = cost + sum(r["cost_usd"] or 0.0 for r in rows[i:])
     return {
@@ -165,6 +180,8 @@ def _build_window(conn, tool, inst, now):
         "unpriced_requests": sum(1 for r in rows if r["cost_usd"] is None),
         "points": points, "_steps": steps, "_vec": cum,
         "external_pct": 0.0, "pct_clean": running, "contaminated": False,
+        "unsegmented_pct": steps[0]["dpct"] if steps and steps[0]["unsegmented"] else 0.0,
+        "quality": None, "reasons": [], "claimed": False, "bias_pct": None, "sources": None,
         "cap": None, "cap_low": None, "cap_high": None, "confidence": None,
         "value": None, "index": None, "in_trend": False,
         # 窗口键：首次看到的重置时间不随后续快照漂移，用来记住用户「不参与分析」的选择
@@ -247,7 +264,9 @@ def _detect_external(w, fit):
     for s in w["_steps"]:
         local = sum(s["vec"].values())
         expected = _expected(s["vec"], fit)[0] if fit else local_rate * local
-        if local <= 0:
+        if s.get("unsegmented"):
+            ext = 0.0
+        elif local <= 0:
             ext = s["dpct"] if s["dpct"] >= IDLE_MIN_STEP else 0.0
         elif s["dpct"] >= EXTERNAL_MIN_STEP and s["dpct"] >= EXTERNAL_FACTOR * expected + EXTERNAL_SLACK:
             ext = s["dpct"] - expected
@@ -255,19 +274,248 @@ def _detect_external(w, fit):
             ext = 0.0
         s["expected"], s["external"] = expected, ext
         external += ext
+    # 对齐：额度更新可能滞后于日志，一步涨得多、下一步没花钱也涨，合起来却符合预期。
+    # 所以疑点总量不超过整个窗口累计的超出部分（有汇率时）；各步按比例缩小
     pct = w["used_percent"]
+    if fit and external > 0:
+        excess = max(0.0, pct - _expected(w["_vec"], fit)[0])
+        if excess < external:
+            for s in w["_steps"]:
+                s["external"] *= excess / external
+            external = excess
+    # 只标记，不扣除：external_pct 是「疑似未记录消耗」，pct_clean 始终等于已用%
     w["external_pct"] = min(external, pct)
-    w["pct_clean"] = pct - w["external_pct"]
+    w["pct_clean"] = pct
     w["contaminated"] = pct > 0 and w["external_pct"] / pct >= CONTAMINATED_SHARE
 
 
 def _set_cap(w):
+    """只有可作条件估计的窗口才有容量数字；其余窗口一律为空，API 和页面都拿不到。"""
+    for k in ("cap", "cap_low", "cap_high", "confidence"):
+        w[k] = None
     pct, cost = w["pct_clean"], w["cost_at_snapshot"]
-    if w["supported"] and pct >= 1 and cost > 0:
+    if w["supported"] and w.get("quality") == "conditional" and pct >= 1 and cost > 0:
         w["cap"] = cost / (pct / 100)
         w["cap_low"] = cost / ((pct + 0.5) / 100)
         w["cap_high"] = cost / ((pct - 0.5) / 100)
-        w["confidence"] = "low" if w["contaminated"] else confidence(pct)
+        w["confidence"] = confidence(pct)
+
+
+# ── 估值条件：覆盖声明、采集缺口、来源分项 ─────────────────
+
+def _coverage_context(conn, tool):
+    ctx = {"claims": db.coverage_claims(conn, tool), "accounts": db.accounts_seen(conn, tool),
+           "gaps": db.collect_gaps(conn, tool), "breakdowns": []}
+    if tool == "claude":
+        ctx["breakdowns"] = [dict(b, **_source_shares(b["rows"], b.get("issues"))) for b in db.breakdowns(conn, tool)]
+    return ctx
+
+
+BREAKDOWN_BAD = {"not_object", "rows_missing", "bad_row"}   # 有行被丢掉或结构不对：整组说不清
+
+
+def _source_shares(rows, issues=None):
+    """一组分项 → Code / 已知未采集 / 来源不明的占比，以及算上取整误差后的上限。
+    known_names / unknown_names：占比大于 0 的来源显示名，给界面说明原因用。"""
+    code = known = unknown = 0.0
+    k_known = k_unknown = 0
+    invalid, known_names, unknown_names = bool(BREAKDOWN_BAD & set(issues or ())), [], []
+    for r in rows:
+        key, pct = r["key"], r["percent"]
+        if pct is None or key.startswith("_"):
+            invalid = True
+            continue
+        name = r.get("display_name") or key
+        if key in COLLECTED_SOURCES:
+            code += pct
+        elif key in KNOWN_UNCOLLECTED:
+            known, k_known = known + pct, k_known + 1
+            if pct > 0:
+                known_names.append(name)
+        else:
+            unknown, k_unknown = unknown + pct, k_unknown + 1
+            if pct > 0:
+                unknown_names.append(name)
+    # 合计明显超过 100：分项本身有问题；明显不足 100：缺的部分来源不明（不自动补齐）
+    if code + known + unknown - 0.5 * len(rows) > 100:
+        invalid = True
+    missing = 100 - (code + known + unknown) - 0.5 * len(rows)
+    if missing > 0 and not invalid:
+        unknown += missing
+    return {"code": code, "known": known, "unknown": unknown, "invalid": invalid,
+            "known_hi": known + 0.5 * k_known, "unknown_hi": unknown + 0.5 * k_unknown,
+            "noncode": known + unknown, "noncode_err": 0.5 * (k_known + k_unknown),
+            "known_names": known_names, "unknown_names": unknown_names}
+
+
+def _window_account(w, accounts):
+    """窗口开始前最后一次看到的账号，加上窗口期间看到的账号。不止一个说明期间换过账号。"""
+    seen = {a for ts, a in accounts if w["start"] <= ts <= w["last_seen"]}
+    before = [a for ts, a in accounts if ts < w["start"]]
+    if before:
+        seen.add(before[-1])
+    return seen
+
+
+def _claim_check(w, ctx):
+    """返回 (适用的声明或 None, 不适用的原因)。
+
+    声明绑定账号，并且只对开始时间不早于生效时刻、且声明持续到窗口最后一次快照的窗口适用。
+    """
+    claims = ctx["claims"]
+    if not claims:
+        return None, {"code": "no_claim"}
+    if all(c["start"] > w["start"] for c in claims):
+        return None, {"code": "claim_after_start"}
+    seen = _window_account(w, ctx["accounts"])
+    if len(seen) > 1:
+        return None, {"code": "account_changed"}
+    if not seen:
+        return None, {"code": "account_unknown"}
+    acct = next(iter(seen))
+    mine = [c for c in claims if c["account"] == acct]
+    if not mine:
+        return None, {"code": "claim_other_account"}
+    until = min(w["end"], w["last_seen"])
+    for c in mine:
+        if c["start"] <= w["start"] and (c["end"] is None or c["end"] >= until):
+            return c, None
+    if any(c["start"] > w["start"] and (c["end"] is None or c["end"] >= until) for c in mine):
+        return None, {"code": "claim_after_start"}
+    return None, {"code": "claim_ended"}
+
+
+def _same_week(b, w):
+    return (w["start"] - RESET_JITTER <= b["as_of"] <= w["end"] + RESET_JITTER
+            and (b["window_start"] is None or abs(b["window_start"] - w["start"]) <= RESET_JITTER))
+
+
+def _weekly_breakdown(w, ctx):
+    """周窗口内、不晚于最后一次额度快照的最新一组分项。"""
+    hits = [b for b in ctx["breakdowns"] if _same_week(b, w) and b["as_of"] <= w["last_seen"] + RESET_JITTER]
+    return hits[-1] if hits else None
+
+
+def _pct_at(points, t):
+    """窗口在 t 时刻的已用%；t 早于第一个快照返回 None。"""
+    pct = None
+    for p in points:
+        if p["ts"] > t:
+            break
+        pct = p["pct"]
+    return pct
+
+
+def _noncode_intervals(weeks, ctx):
+    """用相邻分项之间「非 Code 百分点」（非 Code 占比 × 周已用%）的增量定位非 Code 使用的时段。
+
+    weeks：Claude 总额度的周窗口。返回 (located, flagged, ambiguous)，都是 [(start, end)]：
+    located = 分项能说明情况的时段；flagged = 非 Code 百分点明显上涨；ambiguous = 只有取整级别的变化。
+    """
+    located, flagged, ambiguous = [], [], []
+    for w in weeks:
+        # 窗口起点：非 Code 百分点为 0
+        prev_t, prev_pp, prev_err = w["start"], 0.0, 0.0
+        for b in (b for b in ctx["breakdowns"] if _same_week(b, w)):
+            for t in (b["as_of"], b["last_as_of"]):
+                if t <= prev_t:
+                    continue
+                wpct = _pct_at(w["points"], t)
+                if wpct is None or b["invalid"]:
+                    prev_t, prev_pp, prev_err = t, None, None   # 这一段说不清
+                    continue
+                pp = b["noncode"] / 100 * wpct
+                err = b["noncode_err"] / 100 * wpct + 0.5 * b["noncode"] / 100
+                if prev_pp is not None:
+                    delta = pp - prev_pp
+                    located.append((prev_t, t))
+                    if delta > prev_err + err:
+                        flagged.append((prev_t, t))
+                    elif delta > 1e-9:
+                        ambiguous.append((prev_t, t))
+                prev_t, prev_pp, prev_err = t, pp, err
+    return located, flagged, ambiguous
+
+
+def _overlaps(a0, a1, spans):
+    return any(s < a1 and e > a0 for s, e in spans)
+
+
+def _covered(a0, a1, spans):
+    """[a0, a1] 是否被 spans 的并集完全覆盖。"""
+    t = a0
+    for s, e in sorted(spans):
+        if s > t:
+            break
+        t = max(t, e)
+    return t >= a1
+
+
+def _assess(w, ctx, noncode):
+    """给窗口定质量状态（QUALITY）和原因。证据优先：阻断条件出现时，有没有覆盖声明都不估值。"""
+    if not w["supported"]:
+        return
+    reasons, level = [], "conditional"
+
+    def cap(lv, reason):
+        nonlocal level
+        reasons.append(reason)
+        if QUALITY.index(lv) < QUALITY.index(level):
+            level = lv
+
+    until = min(w["end"], w["last_seen"])
+    gaps = [g for g in ctx["gaps"] if g["start"] < until and g["end"] > w["start"]]
+    if gaps:
+        cap("incomplete", {"code": "collect_gap", "kinds": sorted({g["kind"] for g in gaps})})
+
+    if w["tool"] == "claude":
+        if w["window"] == "seven_day":
+            b = _weekly_breakdown(w, ctx)
+            if b is None:
+                cap("unconfirmed", {"code": "no_breakdown"})
+            else:
+                if w["last_seen"] - b["last_as_of"] > BREAKDOWN_STALE:
+                    # 分项停在较早的时刻：之后的使用来自哪里说不清
+                    cap("unconfirmed", {"code": "breakdown_stale", "as_of": b["last_as_of"]})
+                w["sources"] = {"as_of": b["as_of"], "last_as_of": b["last_as_of"], "rows": b["rows"],
+                                "code": b["code"], "known": b["known"], "unknown": b["unknown"]}
+                if b["invalid"] and w["used_percent"] >= 1:
+                    cap("source_unknown", {"code": "breakdown_invalid"})
+                if b["unknown_hi"] >= SOURCE_SHARE_LIMIT:
+                    cap("source_unknown", {"code": "unknown_sources", "share": b["unknown"], "names": b["unknown_names"]})
+                if b["known_hi"] >= SOURCE_SHARE_LIMIT:
+                    cap("incomplete", {"code": "uncollected_sources", "share": b["known"], "names": b["known_names"]})
+                elif b["unknown_hi"] < SOURCE_SHARE_LIMIT and b["known_hi"] + b["unknown_hi"] >= SOURCE_SHARE_LIMIT:
+                    # 单看都不到阈值，但非 Code 合计到了
+                    cap("incomplete", {"code": "uncollected_sources", "share": b["noncode"],
+                                       "names": b["known_names"] + b["unknown_names"]})
+                if b["noncode"] > 0:
+                    w["bias_pct"] = b["noncode"]   # 估值至少偏低这么多（Code 分项里别的设备还算不进来）
+        elif w["window"] == "five_hour" and noncode is not None:
+            located, flagged, ambiguous = noncode
+            if _overlaps(w["start"], until, flagged):
+                cap("incomplete", {"code": "noncode_in_window"})
+            elif _overlaps(w["start"], until, ambiguous) or not _covered(w["start"], until, located):
+                cap("unconfirmed", {"code": "noncode_unlocated"})
+
+    if w["contaminated"]:
+        recent = [st for st in w["_steps"]
+                  if st.get("external", 0) > 0 and w["last_seen"] - st["ts"] <= ALIGN_SECONDS]
+        if w["active"] and recent:
+            cap("aligning", {"code": "aligning"})
+        else:
+            cap("unconfirmed", {"code": "suspect_unrecorded", "pct": w["external_pct"]})
+
+    if w["used_percent"] < MIN_FIT_PCT or w["cost_at_snapshot"] <= 0:
+        cap("waiting", {"code": "waiting"})
+
+    claim, why = _claim_check(w, ctx)
+    w["claimed"] = claim is not None
+    if claim is None:
+        cap("unconfirmed", why)
+    elif level in ("incomplete", "source_unknown"):
+        reasons.append({"code": "claim_conflict"})   # 声明了覆盖完整，但证据显示有别的来源
+    w["quality"], w["reasons"] = level, reasons
 
 
 # ── 趋势与变化判断 ───────────────────────────────────────
@@ -376,25 +624,39 @@ def _change_status(trend, window_seconds, now, params=DEFAULT_PARAMS):
     return out
 
 
-def _analyze_group(windows, now, params=DEFAULT_PARAMS):
-    """同一 (scope, 窗口类型, 方案) 的全部窗口：识别外部消耗、拟合汇率、折算价值、判断变化。"""
+def _no_assess(w):
+    """没有覆盖信息时（直接调用 _analyze_group 的测试）：只按数据本身定状态，不当作有声明。"""
+    _assess(w, {"claims": [], "accounts": [], "gaps": [], "breakdowns": []}, None)
+
+
+def _analyze_group(windows, now, params=DEFAULT_PARAMS, assess=_no_assess):
+    """同一 (scope, 窗口类型, 方案) 的全部窗口：标记疑点、定估值条件、拟合汇率、折算价值、判断变化。"""
     usable = [w for w in windows if not w["excluded"]]
     recent = [w for w in usable if w["end"] >= now - ANALYSIS_DAYS * 86400]
     anchors = [w for w in _gap_anchors(usable, windows[0]["window_seconds"], now) if w not in recent]
     fit_set = recent + anchors
-    # 第一轮：所有窗口粗拟合 → 识别外部消耗；第二轮：只用干净窗口、扣掉外部消耗后重新拟合
+    # 第一轮：所有窗口粗拟合 → 标记疑点、定估值条件；
+    # 第二轮：只用「可作条件估计」的窗口拟合。没有这样的窗口时，用无疑点窗口做观察拟合，只给详情页看
     fit = _fit_rates([w for w in fit_set if w["used_percent"] >= MIN_FIT_PCT], "used_percent")
     for w in windows:
         _detect_external(w, fit)
-    clean_fit = _fit_rates([w for w in fit_set if not w["contaminated"] and w["pct_clean"] >= MIN_FIT_PCT], "pct_clean")
+        assess(w)
+    basis = "conditional"
+    clean_fit = _fit_rates([w for w in fit_set if w["quality"] == "conditional"], "used_percent")
+    if not clean_fit:
+        basis = "observed"
+        clean_fit = _fit_rates([w for w in fit_set if not w["contaminated"] and w["used_percent"] >= MIN_FIT_PCT],
+                               "used_percent")
     if clean_fit:
         fit = clean_fit
         for w in windows:
             _detect_external(w, fit)
+            assess(w)
     for w in windows:
         _set_cap(w)
 
-    group = {"ref_model": None, "ref_cap": None, "rates": [], "fit_windows": 0, "median_error_pct": None}
+    group = {"ref_model": None, "ref_cap": None, "rates": [], "fit_windows": 0, "median_error_pct": None,
+             "fit_basis": basis if fit else None, "analysis_version": ANALYSIS_VERSION}
     if fit:
         group["fit_windows"] = fit["windows"]
         if fit["median_error"] is not None:
@@ -413,17 +675,51 @@ def _analyze_group(windows, now, params=DEFAULT_PARAMS):
         if spend:
             ref = max(spend, key=spend.get)
             group["ref_model"], group["ref_cap"] = ref[0], 100 / fit["rates"][ref]
+        if spend and basis == "conditional":
             in_range = {id(w) for w in fit_set}
             for w in windows:
                 expected, covered = _expected(w["_vec"], fit)
-                if expected > 0 and w["pct_clean"] > 0 and covered / expected >= 0.7:
+                if (w["quality"] == "conditional" and expected > 0 and w["pct_clean"] > 0
+                        and covered / expected >= 0.7):
                     w["index"] = w["pct_clean"] / expected
                     w["value"] = group["ref_cap"] / w["index"]
-                    w["in_trend"] = (not w["contaminated"] and not w["excluded"]
+                    # 只有可作条件估计的窗口进趋势：声明前的窗口不会混进基线
+                    w["in_trend"] = (not w["excluded"]
                                      and w["pct_clean"] >= MIN_TREND_PCT and id(w) in in_range)
     trend = [w for w in windows if w["in_trend"]]
     group.update(_change_status(trend, windows[0]["window_seconds"], now, params))
+    _eligibility(group, usable, windows[0]["window_seconds"], now)
+    if basis != "conditional":
+        # 观察拟合只说明大致比例，不能当成账号容量：金额类字段一律不输出
+        group["ref_cap"] = None
+        for r in group["rates"]:
+            r["pct_per_unit"] = r["cap_if_only"] = None
     return group
+
+
+def _eligibility(group, usable, window_seconds, now):
+    """趋势资格：收紧/放宽只能来自基线和待检测窗口都满足估值条件的比较。
+    样本不够时区分「不可判断」（窗口有，但不满足条件）和「历史基线不足」（窗口本身就不够）。"""
+    # 独立复核：参与比较的窗口必须全部可作条件估计、各自数量够，才算有资格
+    compared = [w for w in usable if w["role"] in ("recent", "baseline")]
+    rule = SHORT_RULE if window_seconds <= 6 * 3600 else LONG_RULE
+    group["eligible"] = (group["status"] in ("stable", "tighter", "looser")
+                         and all(w["quality"] == "conditional" and w["in_trend"] for w in compared)
+                         and sum(w["role"] == "recent" for w in compared) >= rule["min_recent"]
+                         and sum(w["role"] == "baseline" for w in compared) >= rule["min_baseline"])
+    group["blocked"] = {}
+    if group["status"] != "insufficient":
+        return
+    cands = [w for w in usable if w["supported"] and w["used_percent"] >= MIN_TREND_PCT
+             and w["end"] >= now - ANALYSIS_DAYS * 86400]
+    recent, baseline, older, rule = _split(cands, window_seconds, now)
+    blocked = [w for w in recent + baseline if w["quality"] != "conditional"]
+    for w in blocked:
+        for r in w["reasons"]:
+            group["blocked"][r["code"]] = group["blocked"].get(r["code"], 0) + 1
+    if blocked and (len(recent) >= rule["min_recent"]
+                    and max(len(baseline), len(older)) >= rule["min_baseline"]):
+        group["status"] = "not_eligible"
 
 
 def _fill_plans(windows):
@@ -451,14 +747,21 @@ def analyze(conn, tool, now=None, params=None):
     _fill_plans(windows)
     for w in windows:
         w["excluded"] = w["key"] in rules["windows"]
+    ctx = _coverage_context(conn, tool)
+    noncode = None
+    if tool == "claude":
+        noncode = _noncode_intervals([w for w in windows if w["window"] == "seven_day" and w["scope"] == "all"], ctx)
+
+    def assess(w):
+        _assess(w, ctx, noncode)
     by_key = {}
     for w in windows:
         by_key.setdefault((w["scope"], w["window"], w["plan_type"]), []).append(w)
     groups = []
     for (scope, window, plan), ws in by_key.items():
-        group = _analyze_group(ws, now, params) if ws[0]["supported"] else {"status": "unsupported", "rates": []}
+        group = _analyze_group(ws, now, params, assess) if ws[0]["supported"] else {"status": "unsupported", "rates": []}
         if rules["plans"].get(plan, (None,))[0] == "ignore":
-            group["status"] = "ignored"
+            group["status"], group["eligible"] = "ignored", False
         group.update(tool=tool, scope=scope, window=window, plan_type=plan, window_seconds=ws[0]["window_seconds"],
                      last_seen=max(w["last_seen"] for w in ws), latest_end=max(w["end"] for w in ws),
                      windows_n=len(ws))
@@ -466,7 +769,8 @@ def analyze(conn, tool, now=None, params=None):
         group["trend"] = [{"start": w["start"], "end": w["end"], "last_seen": w["last_seen"], "value": w["value"],
                            "pct": w["used_percent"], "pct_clean": w["pct_clean"], "external_pct": w["external_pct"],
                            "contaminated": w["contaminated"], "in_trend": w["in_trend"], "cost": w["cost_at_snapshot"],
-                           "excluded": w["excluded"], "role": w["role"], "key": w["key"]}
+                           "excluded": w["excluded"], "role": w["role"], "key": w["key"],
+                           "quality": w["quality"], "claimed": w["claimed"]}
                           for w in ws if w["value"] is not None
                           and (w["end"] >= now - ANALYSIS_DAYS * 86400 or w["role"] == "baseline")]
         groups.append(group)
@@ -496,6 +800,6 @@ def public(w, with_points=False):
     if with_points:
         out["points"] = w["points"]
         out["steps"] = [{"ts": s["ts"], "dpct": s["dpct"], "expected": s.get("expected"),
-                         "external": s.get("external", 0.0),
+                         "external": s.get("external", 0.0), "unsegmented": s.get("unsegmented", False),
                          "local_usd": sum(v for k, v in s["vec"].items() if k[1] == "usd")} for s in w["_steps"]]
     return out

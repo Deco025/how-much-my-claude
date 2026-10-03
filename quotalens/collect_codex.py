@@ -17,7 +17,7 @@ import time
 from . import db
 from .paths import codex_dir
 from .pricing import PriceTable, is_on_plan
-from .util import file_changed, iter_complete_lines, parse_ts, window_name
+from .util import file_birth, file_changed, iter_complete_lines, parse_ts, window_name
 
 TOOL = "codex"
 COUNTER_KEYS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
@@ -183,6 +183,8 @@ def sync(prices: PriceTable, history_days: int = 90) -> dict:
                 if change is None:
                     continue
                 st, start, restart = change
+                if restart and cursor is not None:
+                    db.note_gap(conn, TOOL, cursor["mtime_ns"] / 1e9, st.st_mtime, "truncated", path.name)
                 state = FileState(None if restart or cursor is None else json.loads(cursor["state"] or "{}"))
                 usage_rows, snap_rows, schemas, end = [], [], {}, start
                 for raw, end in iter_complete_lines(path, start):
@@ -190,7 +192,10 @@ def sync(prices: PriceTable, history_days: int = 90) -> dict:
                     snap_rows.extend(r for r in snaps if not _deleted(r[6], r[2], deleted))
                     if rec and not _deleted(rec["plan"], rec["ts"], deleted):
                         usage_rows.append(rec)
-            except OSError:
+            except OSError as e:
+                db.note_gap(conn, TOOL, cursor["mtime_ns"] / 1e9 if cursor else file_birth(path, cutoff), time.time(),
+                            "read_error",
+                            f"{path.name}: {type(e).__name__}")
                 continue
             for r in usage_rows:
                 cost = prices.cost(r["model"], input_tokens=r["input"], cache_read=r["cache_read"],
@@ -202,6 +207,7 @@ def sync(prices: PriceTable, history_days: int = 90) -> dict:
             conn.executemany(INSERT_SNAPSHOT, snap_rows)
             for fp, (first, last, paths) in schemas.items():
                 db.note_schema(conn, TOOL, "log", None, first, last, fingerprint=(fp, paths))
+            db.clear_read_gaps(conn, TOOL, path.name)
             stats["rows"] += len(usage_rows)
             stats["snapshots"] += len(snap_rows)
             stats["changed"] += 1

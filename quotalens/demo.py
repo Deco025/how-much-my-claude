@@ -3,8 +3,10 @@
   how-much-my-claude-server --demo --open     （从源码运行：python run.py --demo --open）
 
 数据放在临时目录、按「现在」生成，不读任何真实日志，不查额度，不联网。剧情：
+  - 两个工具都在数据开始前打开了覆盖声明（虚构账号），所以窗口可作条件估计；
   - Codex 的 5 小时窗口最近 3 天被悄悄收紧了 30%（会触发告警），每周窗口没变；
-  - Claude 两个窗口都没变，其中一个 5 小时窗口里有一段网页聊天（外部消耗，会被识别、扣掉）。
+  - Claude 两个窗口都没变。11 天前在网页上聊了一会儿：周来源分项里出现了 Chats 占比，
+    那一周和那段时间的 5 小时窗口进入「采集不完整」，不估值、不参与趋势（网页用量不会被扣掉）。
 """
 import math
 import random
@@ -131,6 +133,7 @@ def populate(now=None, seed=7) -> dict:
         # ── Claude：日志只有用量，百分比靠每 3 分钟查一次接口 ──
         five, week = _Window(FIVE_HOURS, CLAUDE_5H), _Window(WEEK, CLAUDE_WEEK)
         n, last_poll, web_chat_day = 0, 0.0, now - 11 * 86400
+        chat_pp, chat_week = 0.0, None   # 本周网页聊天用掉的百分点
         for start, end in _sessions(rng, now, per_day=0.85, last_start=1.8 * 3600):
             ts, chatted = start, False
             while ts < end:
@@ -150,16 +153,36 @@ def populate(now=None, seed=7) -> dict:
                 week.spend(model, cost)
                 n += 1
                 # 11 天前那段使用中间，在网页上聊了一会儿：百分比涨了，本地日志里没有
+                if chat_week != week.reset:
+                    chat_pp, chat_week = 0.0, week.reset
                 if not chatted and abs(start - web_chat_day) < 86400 and ts > start + 3600:
-                    five.pct, week.pct, chatted = min(100.0, five.pct + 14), min(100.0, week.pct + 1.5), True
+                    five.pct, week.pct, chatted = min(100.0, five.pct + 14), min(100.0, week.pct + 4), True
+                    chat_pp += 4
                     last_poll = 0.0
                 if ts - last_poll >= 180:
                     for w, name in ((five, "five_hour"), (week, "seven_day")):
                         conn.execute(INSERT_SNAPSHOT, ("claude", "all", name, ts, float(int(w.pct)), w.reset,
                                                        w.length, "pro", "api"))
                         counts["snapshots"] += 1
+                    db.save_breakdown(conn, "claude", "seven_day", ts, week.reset - WEEK,
+                                      _breakdown_rows(week.pct, chat_pp), now=ts)
                     last_poll = ts
                 ts += rng.uniform(100, 220)
         counts["usage"] += n
         conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('price_version', ?)", (prices.version,))
+        # 覆盖声明：数据开始前一天打开，绑定虚构账号
+        since = now - (DAYS + 1) * 86400
+        for tool in ("codex", "claude"):
+            db.note_account(conn, tool, since, f"demo-{tool}")
+            conn.execute("INSERT INTO coverage_claim (tool, account, start, end) VALUES (?, ?, ?, NULL)",
+                         (tool, f"demo-{tool}", since))
     return counts
+
+
+def _breakdown_rows(week_pct, chat_pp):
+    """周来源分项：占已用部分的整数百分比。"""
+    chat = round(100 * chat_pp / week_pct) if week_pct > 0 else 0
+    return [{"key": "claude_code", "display_name": "Claude Code", "percent": float(100 - chat)},
+            {"key": "chat", "display_name": "Chats", "percent": float(chat)},
+            {"key": "cowork", "display_name": "Cowork", "percent": 0.0},
+            {"key": "other", "display_name": "Other", "percent": 0.0}]

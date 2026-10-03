@@ -31,7 +31,7 @@ Turns your Codex CLI and Claude Code subscription usage into API-equivalent doll
 - **What a window is worth**: how many dollars of API usage each 5-hour and weekly window holds, down to each model — the same $1 can use up very different amounts of quota on different models.
 - **Whether the quota changed**: every window is measured with the same ruler; when recent windows fall outside normal noise you get a banner and a system notification. A rubber stamp and a deviation gauge make the verdict obvious.
 - **Whether it will last**: a pixel progress bar shows what you've used, where you'll be at reset at the current pace, and how much of the window's time has passed; running out early turns it red.
-- **Not fooled by noise**: usage your local logs can't see (other devices, web chat) is detected and removed; coming back after a break compares across the gap; switching main models is reported honestly as "can't compare yet".
+- **Not fooled by noise**: usage your local logs can't see (other devices, web chat) is flagged, and windows that can't be accounted for get no estimate; coming back after a break compares across the gap; switching main models is reported honestly as "can't compare yet".
 - **Fully local**: it only reads local logs — no separate sign-in, no uploads, no telemetry. Data is kept forever, and you decide what to keep or delete.
 
 <picture>
@@ -115,7 +115,7 @@ So just install them, sign in, and use them once. If something is missing, the t
 
 The first launch imports the last 90 days of logs (a few GB take about 10 s), then scans incrementally every 60 s. Older logs can be imported with one click under Data.
 
-**Settings** (bottom of the page): language, system notifications, how often to check Claude quota while idle, the minimum change that counts as "adjusted", the "new model" threshold, and how many days to import on first launch.
+**Settings** (bottom of the page): language, system notifications, how often to check Claude quota while idle, the minimum change that counts as "adjusted", the "new model" threshold, how many days to import on first launch, and a coverage declaration per tool (off by default).
 
 ## Privacy and security
 
@@ -147,7 +147,9 @@ Every verdict, number and model name on the page is computed from your own data 
 
 1. **API-equivalent spend**: fresh input × input price + cache reads × cache-read price + cache writes × cache-write price + output × output price, with prices from [models.dev](https://models.dev) (refreshed daily, including long-context tiers and fast mode). Claude 1-hour cache writes count at 2× input, 5-minute ones at 1.25×. Codex `input_tokens` include cached tokens, which are subtracted first. All history is re-priced with the same table, so price updates don't create fake jumps.
 2. **Assigning usage to windows**: Codex logs record the window (`resets_at`) each request used, so attribution is exact even across account switches. Claude logs don't, so usage is assigned by time — this assumes one Claude account and no API key running `claude-*` models.
-3. **External usage**: usage outside local logs (other devices, cloud tasks, claude.ai chat) raises the percentage with no local spend. Steps that jump ≥3% and more than 3× the expected rise plus 2 points, or rise ≥2% with no local spend at all, count as external and are subtracted. Windows with ≥15% external usage are left out.
+3. **Usage local logs can't see**: other devices, cloud tasks, claude.ai chat and Cowork raise the percentage with no local spend. Steps that jump ≥3% and more than 3× the expected rise plus 2 points, or rise ≥2% with no local spend at all, are flagged as "possibly unrecorded usage". They are **flagged, not subtracted**: the used percentage is shown as the API reports it. Windows where flagged usage is ≥15% of the used percentage are left out of fitting and trends.
+   - For Claude weekly windows, the source breakdown from the API (Claude Code / Chats / Cowork / other) is read too. If everything outside Claude Code adds up to 5% or more (rounding included), the window is "incomplete". A missing, stale or malformed breakdown makes it "source unknown". Five-hour windows that overlap a rise in the non-Code share are treated the same way.
+   - **Estimate conditions**: every window has a quality state. Only "conditional" windows show a dollar capacity ("a full window is worth about …") and count toward trend verdicts; the others just show the reason. Since this project can't tell which computer Claude Code ran on, Settings has a **coverage declaration**: "all usage of this account's quota during this period is collected by this project" (e.g. Claude Code on this computer only, no web or mobile app). It is **off by default**, tied to the current account and the time it was turned on: it doesn't cover earlier windows, doesn't carry over to another account, and a window where the account changed or the declaration was turned off isn't covered. Even then, the estimate is a lower bound and the page says why.
 4. **Model rates**: quota use isn't proportional to API price, so per-model rates are fitted with non-negative least squares over clean windows of the last 60 days: used% ≈ Σ rate[model] × spend[model].
 5. **Trend and alerts**: each window is converted to "what it's worth if spent entirely on the main model". 5-hour windows: last 72 hours vs the 3 weeks before (≥3 and ≥5 windows). Weekly windows: latest vs the previous 2–4. The median ratio is compared with a threshold = max(the minimum change in Settings, default 20%; 2.5 × baseline spread × sample-size factor), so noisy data widens it automatically. Crossing it shows a banner and a system notification (once per direction per 24 h).
    - **Across a break**: when you stop for a while and come back, there are no recent windows to compare with, so the last windows before the break become the baseline and the card says so. Otherwise a change made during the break would silently become the new normal. The chart folds the break into a short gap.
@@ -160,7 +162,9 @@ Every verdict, number and model name on the page is computed from your own data 
 
 ## Known limitations
 
-- Usage that local logs can't see can only be detected and subtracted, not reconstructed; polluted windows are left out.
+- Usage that local logs can't see can only be flagged, not reconstructed; clearly affected windows are left out, and uncertain ones get no estimate.
+- Importing history only reads logs still on disk; deleted or unsaved parts show up as collection gaps, and an import can't prove nothing is missing.
+- The 5% "significant share" threshold is a product assumption still being checked against real data.
 - Claude logs don't record the account or key: switching Claude accounts, or running `claude-*` models with an Anthropic API key, mixes into the current account's windows.
 - Requests routed to third-party models through tools like CC Switch (deepseek, glm, …) are recognized and not counted or priced.
 - Percentages are integers, so estimates are wide early in a window.

@@ -9,6 +9,10 @@ raw_response   额度接口的原始响应归档（相同内容只延长时间�
 schema_seen    额度数据的字段结构指纹及首末出现时间，用来发现接口 / 日志格式变化
 alert          额度变化告警
 data_rule      用户在页面上对数据做的选择：某个订阅方案 / 某个窗口不参与分析，或某个方案的数据已删除
+account_seen   查额度时看到的登录账号（不可逆摘要）
+source_breakdown Claude 周额度的来源分项（Claude Code / Chats / Cowork / 其他）
+collect_gap    采集器发现的缺口（读取或解析失败、文件截断、超出导入期限）
+coverage_claim 用户的覆盖声明（绑定账号和生效时间）
 
 数据默认永久保存，不会自动清理；Claude Code 默认 30 天后删掉自己的日志，这里的副本不受影响。
 """
@@ -107,7 +111,8 @@ CREATE TABLE IF NOT EXISTS alert (
     window    TEXT NOT NULL,
     direction TEXT NOT NULL,     -- tighter / looser
     ratio     REAL NOT NULL,
-    detail    TEXT
+    detail    TEXT,
+    analysis_version INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS data_rule (
@@ -118,6 +123,50 @@ CREATE TABLE IF NOT EXISTS data_rule (
     until  REAL,                 -- deleted：删除时刻。重读日志时跳过这之前属于该方案的数据，删掉的不会回来
     ts     REAL NOT NULL,
     PRIMARY KEY (tool, kind, target)
+);
+
+-- 每次查额度时看到的登录账号（只存不可逆摘要）。窗口的账号从这里按时间取，覆盖声明据此绑定账号
+CREATE TABLE IF NOT EXISTS account_seen (
+    tool    TEXT NOT NULL,
+    ts      REAL NOT NULL,
+    account TEXT NOT NULL,
+    PRIMARY KEY (tool, ts)
+);
+
+-- Claude 周额度的来源分项（seven_day_breakdown）：已用部分里各产品的占比
+CREATE TABLE IF NOT EXISTS source_breakdown (
+    tool          TEXT NOT NULL,
+    window        TEXT NOT NULL,   -- seven_day
+    as_of         REAL NOT NULL,   -- 分项的统计时刻
+    window_start  REAL,            -- 分项所属窗口的开始时刻
+    fetched_at    REAL NOT NULL,
+    key           TEXT NOT NULL,   -- claude_code / chats / cowork / other / 未知新产品原样保存
+    display_name  TEXT,
+    percent       REAL,            -- 占已用部分的百分比；NULL = 字段无法解析
+    last_as_of    REAL,            -- 相同分项最后一次被确认的时刻
+    PRIMARY KEY (tool, window, as_of, key)
+);
+
+-- 采集器发现的缺口：读取失败、解析失败、文件被截断或轮换、超出导入期限。缺口期间的窗口不能证明记录完整
+CREATE TABLE IF NOT EXISTS collect_gap (
+    id      INTEGER PRIMARY KEY,
+    tool    TEXT NOT NULL,
+    start   REAL NOT NULL,
+    end     REAL NOT NULL,
+    kind    TEXT NOT NULL,       -- read_error / parse_error / truncated / horizon
+    detail  TEXT,
+    ts      REAL NOT NULL,
+    UNIQUE (tool, start, end, kind, detail)
+);
+
+-- 覆盖声明：用户声明「这个账号在此期间所有消耗该额度的使用都会被本项目采集到」。
+-- 绑定账号和生效时间；关闭时写入 end，不删除记录，历史估值的条件可追溯
+CREATE TABLE IF NOT EXISTS coverage_claim (
+    id      INTEGER PRIMARY KEY,
+    tool    TEXT NOT NULL,
+    account TEXT NOT NULL,
+    start   REAL NOT NULL,
+    end     REAL
 );
 """
 
@@ -138,8 +187,32 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
+
+
+# 给已有表补列：(表, 列, 定义)。只加列，不改不删
+COLUMNS = [
+    ("alert", "analysis_version", "INTEGER NOT NULL DEFAULT 1"),   # 产生告警的分析算法版本；旧告警是 1
+    ("source_breakdown", "last_as_of", "REAL"),                    # 相同分项最后一次被确认的时刻
+    ("source_breakdown", "issues", "TEXT"),                        # 解析时发现的问题（JSON 列表），同组每行相同
+]
+
+SAME_WINDOW = 900   # 同一窗口的开始时间在相邻两次查询间的最大漂移（秒），与 calibrate.RESET_JITTER 一致
+
+
+def round_reset(ts):
+    """重置时间取整到分钟（接口返回的值每次有亚秒级漂移），用于判断轮询结果有没有变化。"""
+    return None if ts is None else round(ts / 60) * 60
+
+
+def _migrate(conn) -> None:
+    for table, column, decl in COLUMNS:
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    conn.commit()
 
 
 @contextmanager
@@ -230,6 +303,115 @@ def data_rules(conn, tool: str) -> dict:
         elif r["kind"] == "window" and r["mode"] == "ignore":
             out["windows"].add(r["target"])
     return out
+
+
+def note_account(conn, tool: str, ts: float, account) -> None:
+    """只在账号和上一次记录的不同时写一行（账号变化的时间点就足够判断窗口归属）。"""
+    if not account:
+        return
+    last = conn.execute("SELECT account FROM account_seen WHERE tool = ? AND ts <= ? ORDER BY ts DESC LIMIT 1",
+                        (tool, ts)).fetchone()
+    if not last or last["account"] != account:
+        conn.execute("INSERT OR IGNORE INTO account_seen (tool, ts, account) VALUES (?, ?, ?)", (tool, ts, account))
+
+
+def accounts_seen(conn, tool: str):
+    """[(ts, 账号摘要)]，按时间排序。"""
+    return [(r["ts"], r["account"]) for r in
+            conn.execute("SELECT ts, account FROM account_seen WHERE tool = ? ORDER BY ts", (tool,))]
+
+
+def latest_account(conn, tool: str):
+    r = conn.execute("SELECT account FROM account_seen WHERE tool = ? ORDER BY ts DESC LIMIT 1", (tool,)).fetchone()
+    return r["account"] if r else None
+
+
+def get_meta(conn, key: str, default=None):
+    r = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return r["value"] if r else default
+
+
+def set_meta(conn, key: str, value) -> None:
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, str(value)))
+
+
+def note_gap(conn, tool: str, start: float, end: float, kind: str, detail=None, now=None) -> None:
+    conn.execute("INSERT OR IGNORE INTO collect_gap (tool, start, end, kind, detail, ts) VALUES (?, ?, ?, ?, ?, ?)",
+                 (tool, start, end, kind, detail, now or time.time()))
+
+
+def clear_read_gaps(conn, tool: str, name: str) -> None:
+    """文件后来读成功了：读失败时游标没有前进，之前漏读的内容这次已经补上，删掉它的读取失败缺口。"""
+    prefix = f"{name}: "
+    conn.execute("DELETE FROM collect_gap WHERE tool = ? AND kind = 'read_error' AND substr(detail, 1, ?) = ?",
+                 (tool, len(prefix), prefix))
+
+
+def collect_gaps(conn, tool: str):
+    return [dict(r) for r in conn.execute(
+        "SELECT start, end, kind, detail FROM collect_gap WHERE tool = ? ORDER BY start", (tool,))]
+
+
+def save_breakdown(conn, tool: str, window: str, as_of: float, window_start, rows, now=None, issues=()) -> bool:
+    """保存一组来源分项。和上一组内容相同（同一窗口、同样的分项）只把上一组的 last_as_of 延长到 as_of。
+    返回内容是否有变化（新窗口或占比变了），用来让分析缓存失效。"""
+    now = now or time.time()
+    last = conn.execute("SELECT as_of, window_start, last_as_of FROM source_breakdown WHERE tool = ? AND window = ?"
+                        " ORDER BY as_of DESC LIMIT 1", (tool, window)).fetchone()
+    if last and as_of <= max(last["as_of"], last["last_as_of"] or last["as_of"]):
+        return False   # 旧的或重复的（回填时会遇到）
+    same_window = last and (last["window_start"] == window_start or (
+        last["window_start"] is not None and window_start is not None
+        and abs(last["window_start"] - window_start) <= SAME_WINDOW))
+    if same_window:
+        prev = [(r["key"], r["display_name"], r["percent"]) for r in conn.execute(
+            "SELECT key, display_name, percent FROM source_breakdown WHERE tool = ? AND window = ? AND as_of = ?"
+            " ORDER BY key", (tool, window, last["as_of"]))]
+        cur = sorted((r["key"], r.get("display_name"), r.get("percent")) for r in rows)
+        if prev == cur:
+            conn.execute("UPDATE source_breakdown SET last_as_of = ? WHERE tool = ? AND window = ? AND as_of = ?",
+                         (as_of, tool, window, last["as_of"]))
+            return False
+    conn.executemany(
+        "INSERT OR IGNORE INTO source_breakdown"
+        " (tool, window, as_of, window_start, fetched_at, key, display_name, percent, last_as_of, issues)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [(tool, window, as_of, window_start, now, r["key"], r.get("display_name"), r.get("percent"), as_of,
+          json.dumps(list(issues)) if issues else None) for r in rows])
+    return True
+
+
+def breakdowns(conn, tool: str, window: str = "seven_day"):
+    """[{"as_of", "last_as_of", "window_start", "rows": [{key, display_name, percent}]}]，按 as_of 排序。
+    同一组的占比在 [as_of, last_as_of] 期间每次查询都没变。"""
+    out = {}
+    for r in conn.execute("SELECT as_of, last_as_of, window_start, key, display_name, percent, issues"
+                          " FROM source_breakdown WHERE tool = ? AND window = ? ORDER BY as_of, key", (tool, window)):
+        item = out.setdefault(r["as_of"], {"as_of": r["as_of"], "last_as_of": r["last_as_of"] or r["as_of"],
+                                           "window_start": r["window_start"], "rows": [],
+                                           "issues": json.loads(r["issues"]) if r["issues"] else []})
+        item["rows"].append({"key": r["key"], "display_name": r["display_name"], "percent": r["percent"]})
+    return list(out.values())
+
+
+def coverage_claims(conn, tool: str):
+    return [dict(r) for r in conn.execute(
+        "SELECT id, account, start, end FROM coverage_claim WHERE tool = ? ORDER BY start", (tool,))]
+
+
+def set_coverage_claim(conn, tool: str, account, on: bool, now=None) -> None:
+    """打开：为该账号新开一段声明（已有未结束的就不动）；关闭：结束该工具所有未结束的声明。"""
+    now = now or time.time()
+    open_rows = conn.execute("SELECT id, account FROM coverage_claim WHERE tool = ? AND end IS NULL", (tool,)).fetchall()
+    if on:
+        if not account:
+            raise ValueError("account unknown")
+        if any(r["account"] == account for r in open_rows):
+            return
+        conn.execute("UPDATE coverage_claim SET end = ? WHERE tool = ? AND end IS NULL", (now, tool))
+        conn.execute("INSERT INTO coverage_claim (tool, account, start, end) VALUES (?, ?, ?, NULL)", (tool, account, now))
+    else:
+        conn.execute("UPDATE coverage_claim SET end = ? WHERE tool = ? AND end IS NULL", (now, tool))
 
 
 def set_rule(conn, tool: str, kind: str, target: str, mode, until=None) -> None:

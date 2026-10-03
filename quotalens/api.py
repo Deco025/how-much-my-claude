@@ -52,9 +52,11 @@ def create_app(service: Service, on_show=None, on_quit=None) -> FastAPI:
     def _current(w, group):
         out = calibrate.public(w)
         out["remaining_if_only"] = []
-        for key in ("ref_model", "ref_cap", "baseline_median", "recent_median", "status", "ratio", "threshold"):
+        for key in ("ref_model", "ref_cap", "baseline_median", "recent_median", "status", "ratio", "threshold",
+                    "eligible", "blocked", "fit_basis"):
             out[key] = group.get(key) if group else None
-        if not group or not w["active"]:
+        # 「按某模型还能用多少钱」也是容量估值：只在窗口可作条件估计时给
+        if not group or not w["active"] or w.get("quality") != "conditional" or group.get("fit_basis") != "conditional":
             return out
         left = max(0.0, 100 - w["used_percent"])
         for r in group.get("rates", []):
@@ -142,6 +144,19 @@ def create_app(service: Service, on_show=None, on_quit=None) -> FastAPI:
     @app.post("/api/settings")
     def post_settings(changes: dict = Body(...)):
         return {"values": service.update_settings(changes)}
+
+    @app.get("/api/coverage")
+    def get_coverage():
+        return service.coverage()
+
+    @app.post("/api/coverage")
+    def post_coverage(tool: str = Body(...), on: bool = Body(...)):
+        """覆盖声明：这个账号此后所有消耗额度的使用都会被本项目采集到。绑定当前账号，从现在起生效。"""
+        _check_tool(tool)
+        try:
+            return service.set_coverage(tool, on)
+        except ValueError:
+            raise HTTPException(409, "读不到当前登录的账号，声明不能生效") from None
 
     @app.get("/api/connections")
     def connections():

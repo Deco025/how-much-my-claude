@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.request
 
-from . import db
+from . import account, db
 from .paths import codex_dir
 from .util import parse_ts, window_name
 
@@ -86,7 +86,9 @@ def poll(timeout=15) -> dict:
     with db.writer() as conn:
         conn.executemany(INSERT_SNAPSHOT, rows)
         db.archive_response(conn, "codex", result["at"], body)
+        db.note_account(conn, "codex", result["at"], account.codex_account())
     result["windows"] = len(rows)
-    result["percents"] = {f"{scope}:{window}": pct for scope, window, _, pct, *_ in rows}
+    # 百分比和重置时间：任何一个变了，分析缓存都要更新（提前重置时百分比可能不变）
+    result["percents"] = {f"{scope}:{window}": [pct, db.round_reset(resets)] for scope, window, _, pct, resets, *_ in rows}
     result["plan"] = body.get("plan_type")
     return result

@@ -11,7 +11,7 @@ import time
 from . import db
 from .paths import claude_dir
 from .pricing import PriceTable, is_on_plan
-from .util import file_changed, iter_complete_lines, parse_ts
+from .util import file_birth, file_changed, iter_complete_lines, parse_ts
 
 TOOL = "claude"
 
@@ -28,14 +28,18 @@ WHERE excluded.output_tokens > usage.output_tokens
 """
 
 
+PARSE_ERROR = "parse_error"   # 看起来是带用量的消息却解析不了：记一个采集缺口
+RETENTION_DAYS = 30           # Claude Code 默认保留日志的天数（cleanupPeriodDays）
+
+
 def parse_line(raw: bytes):
-    """解析一行；不是带用量的 assistant 消息就返回 None。"""
+    """解析一行；不是带用量的 assistant 消息就返回 None，像是但解析失败返回 PARSE_ERROR。"""
     if b'"assistant"' not in raw or b'"usage"' not in raw:
         return None
     try:
         d = json.loads(raw)
     except ValueError:
-        return None
+        return PARSE_ERROR
     if d.get("type") != "assistant":
         return None
     msg = d.get("message") or {}
@@ -90,8 +94,13 @@ def sync(prices: PriceTable, history_days: int = 90) -> dict:
     stats = {"files": 0, "changed": 0, "rows": 0}
     if not root.is_dir():
         return stats
-    cutoff = time.time() - history_days * 86400
+    now = time.time()
+    cutoff = now - history_days * 86400
     with db.writer() as conn:
+        last_sync = float(db.get_meta(conn, "claude_last_sync", 0) or 0)
+        if last_sync and now - last_sync > RETENTION_DAYS * 86400:
+            # 上次同步到现在超过日志保留期：这期间可能有日志已被 Claude Code 删掉
+            db.note_gap(conn, TOOL, last_sync, now - RETENTION_DAYS * 86400, "horizon", now=now)
         cursors = {r["path"]: r for r in conn.execute("SELECT * FROM file_cursor WHERE path LIKE ?", (str(root) + "%",))}
         for path in root.rglob("*.jsonl"):
             stats["files"] += 1
@@ -102,13 +111,31 @@ def sync(prices: PriceTable, history_days: int = 90) -> dict:
                 change = file_changed(path, cursors.get(key))
                 if change is None:
                     continue
-                st, start, _ = change
-                messages, end = {}, start
+                st, start, reread = change
+                prev = cursors.get(key)
+                if reread and prev is not None:
+                    # 文件变短了（被截断或重写）：上次读到的内容可能已经不在了
+                    db.note_gap(conn, TOOL, prev["mtime_ns"] / 1e9, st.st_mtime, "truncated", path.name, now=now)
+                messages, end, last_ts, bad = {}, start, prev["mtime_ns"] / 1e9 if prev else None, 0
                 for raw, end in iter_complete_lines(path, start):
                     rec = parse_line(raw)
-                    if rec and (rec["id"] not in messages or _better(rec, messages[rec["id"]])):
-                        messages[rec["id"]] = rec
-            except OSError:
+                    if rec is PARSE_ERROR:
+                        if not bad:
+                            err_from = last_ts
+                        bad += 1
+                        continue
+                    if rec:
+                        last_ts = rec["ts"] if last_ts is None else max(last_ts, rec["ts"])
+                        if rec["id"] not in messages or _better(rec, messages[rec["id"]]):
+                            messages[rec["id"]] = rec
+                if bad:
+                    db.note_gap(conn, TOOL, min(err_from or st.st_mtime, st.st_mtime), st.st_mtime, "parse_error",
+                                f"{path.name}: {bad}", now=now)
+            except OSError as e:
+                prev = cursors.get(key)
+                db.note_gap(conn, TOOL, prev["mtime_ns"] / 1e9 if prev else file_birth(path, last_sync or cutoff), now,
+                            "read_error",
+                            f"{path.name}: {type(e).__name__}", now=now)
                 continue
             for r in messages.values():
                 if not (r["input"] or r["output"] or r["cache_read"] or r["cw_5m"] or r["cw_1h"]):
@@ -119,6 +146,7 @@ def sync(prices: PriceTable, history_days: int = 90) -> dict:
                 conn.execute(UPSERT, (r["id"], r["ts"], r["model"], int(is_on_plan(TOOL, r["model"])),
                                       r["session_id"], r["input"], r["cache_read"], r["cw_5m"], r["cw_1h"],
                                       r["output"], r["reasoning"], r["speed"], cost))
+            db.clear_read_gaps(conn, TOOL, path.name)
             stats["rows"] += len(messages)
             stats["changed"] += 1
             conn.execute(
@@ -126,4 +154,5 @@ def sync(prices: PriceTable, history_days: int = 90) -> dict:
                 (key, st.st_size, st.st_mtime_ns, end),
             )
             conn.commit()
+        db.set_meta(conn, "claude_last_sync", now)
     return stats

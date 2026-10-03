@@ -37,7 +37,7 @@
 
     <section>
       <h2 data-k="02"><span data-i18n="额度有没有被调">额度有没有被调</span>
-        <span class="info" tabindex="0" data-i18n-tip="每个窗口都折算成「全用主力模型时值多少钱」，消除模型组合的影响。偏离仪的指针是最近几个窗口比之前变了多少，中间绿色一段是正常波动范围，落到左边红区是收紧、右边黄区是放宽。下面小图里的灰带也是这个范围；最近的窗口偏出灰带才判为变化。空心点是被外部消耗污染（别的设备、云任务、网页聊天）或用量太少的窗口，不参与判断。竖线是规则变化（提前重置、方案变化、接口字段变化）。点一个点可以看那个窗口的详情。">?</span>
+        <span class="info" tabindex="0" data-i18n-tip="每个窗口都折算成「全用主力模型时值多少钱」，消除模型组合的影响。偏离仪的指针是最近几个窗口比之前变了多少，中间绿色一段是正常波动范围，落到左边红区是收紧、右边黄区是放宽。下面小图里的灰带也是这个范围；最近的窗口偏出灰带才判为变化。空心点是不满足估值条件（采集不完整、覆盖待确认等）或用量太少的窗口，不参与判断。竖线是规则变化（提前重置、方案变化、接口字段变化）。点一个点可以看那个窗口的详情。">?</span>
       </h2>
       <div id="monitor" class="grid-2"></div>
       <div id="detail" class="panel" hidden>
@@ -46,6 +46,7 @@
           <span id="detail-note" class="muted"></span>
           <button id="detail-exclude" type="button" class="mini"></button>
         </div>
+        <div id="detail-quality" class="detail-quality"></div>
         <div id="detail-chart" class="chart"></div>
       </div>
     </section>

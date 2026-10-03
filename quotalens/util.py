@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 from datetime import datetime, timezone
 
 _FRACTION = re.compile(r"\.(\d+)")
@@ -56,3 +57,16 @@ def file_changed(path, cursor):
     if cursor and st.st_size >= cursor["offset"]:
         return st, cursor["offset"], False
     return st, 0, True
+
+
+def file_birth(path, fallback: float) -> float:
+    """文件的创建时间（取不到时用 fallback），用作新文件读取失败时缺口的起点。
+    Linux 的 st_ctime 是元数据变更时间、不是创建时间，不能用。"""
+    try:
+        st = path.stat()
+    except OSError:
+        return fallback
+    born = getattr(st, "st_birthtime", None)
+    if born is None and sys.platform == "win32":
+        born = st.st_ctime
+    return max(born, fallback) if born else fallback

@@ -25,7 +25,13 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
-  if (!res.ok) throw new Error(`${path} → HTTP ${res.status}`);
+  if (!res.ok) {
+    let detail = "";
+    try { detail = (await res.json()).detail || ""; } catch { /* 不是 JSON */ }
+    const err = new Error(typeof detail === "string" && detail ? detail : `${path} → HTTP ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
   return res.json();
 }
 
@@ -86,12 +92,46 @@ const now = () => Date.now() / 1000;
 
 const WINDOW_SHORT = { five_hour: "5 小时", seven_day: "每周", thirty_day: "30 天" };
 const TOOL_NAMES = { codex: "Codex", claude: "Claude" };
-const STATE_NAMES = { stable: "稳定", tighter: "可能被收紧", looser: "可能被放宽", insufficient: "数据不足",
-  model_changed: "主力模型变了", ignored: "不参与分析" };
+const STATE_NAMES = { stable: "稳定", tighter: "可能被收紧", looser: "可能被放宽", insufficient: "历史基线不足",
+  not_eligible: "不可判断", model_changed: "主力模型变了", ignored: "不参与分析" };
 // 「额度有没有被调」卡片上的检验章
-const STAMPS = { stable: "未见调整", tighter: "疑似收紧", looser: "疑似放宽", insufficient: "样本不足",
-  model_changed: "换了模型" };
+const STAMPS = { stable: "未见调整", tighter: "疑似收紧", looser: "疑似放宽", insufficient: "基线不足",
+  not_eligible: "不可判断", model_changed: "换了模型" };
 const stateName = (s) => t(STATE_NAMES[s] || s);
+
+// 窗口的估值条件。只有「可作条件估计」显示容量估值；其余只显示本机 API 等价金额、额度比例和原因
+const QUALITY_NAMES = { incomplete: "采集不完整", source_unknown: "来源待确认", aligning: "正在对齐",
+  waiting: "等待更多消耗", unconfirmed: "覆盖待确认", conditional: "可作条件估计" };
+const qualityName = (q) => t(QUALITY_NAMES[q] || q);
+
+function reasonText(r) {
+  const pct = (v) => Math.round(v ?? 0);
+  const names = Array.isArray(r.names) ? r.names.map((n) => t(n)).join(t("、")) : "";
+  switch (r.code) {
+    case "collect_gap": return t("这段时间采集有缺口（日志读取失败或断档），中间可能漏了记录");
+    case "no_breakdown": return t("没拿到这一周的来源分项");
+    case "breakdown_invalid": return t("这一周的来源分项读不懂");
+    case "breakdown_stale": return t("来源分项停在 {when}，之后的使用来自哪里无法确认", { when: when(r.as_of) });
+    case "unknown_sources": return names ? t("来源不明的使用约占已用的 {pct}%（{names}）", { pct: pct(r.share), names })
+      : t("来源不明的使用约占已用的 {pct}%", { pct: pct(r.share) });
+    case "uncollected_sources": return t("{names} 约占已用的 {pct}%，这些使用本项目采集不到", { pct: pct(r.share), names });
+    case "noncode_in_window": return t("这段时间有 Claude Code 以外的使用（网页、App 或 Cowork）");
+    case "noncode_unlocated": return t("来源分项不能说明这段时间有没有 Claude Code 以外的使用");
+    case "aligning": return t("日志和额度快照可能还没同步，稍后再看");
+    case "suspect_unrecorded": return t("额度涨得比本机记录多（疑似未记录消耗约 {pct}%，只是疑点，没有扣除）", { pct: pct(r.pct) });
+    case "waiting": return t("用量还太少，变化不足以估算");
+    case "no_claim": return t("没有打开覆盖声明，不能确认这个账号的使用都被采集到了");
+    case "account_unknown": return t("读不到当前账号，覆盖声明不适用");
+    case "account_changed": return t("这个窗口期间切换过账号");
+    case "claim_other_account": return t("覆盖声明属于别的账号");
+    case "claim_after_start": return t("覆盖声明在这个窗口开始之后才打开");
+    case "claim_ended": return t("这个窗口开始时覆盖声明已经关闭");
+    case "claim_conflict": return t("你声明了覆盖完整，但数据显示有别的来源，以数据为准");
+    default: return r.code;
+  }
+}
+
+const capRange = (w) => t("约 {low}～{high}", { low: usd(w.cap_low), high: usd(w.cap_high) });
 
 // 像素小图标，16×10 格：X 是主色，o 是眼睛。Claude 是吉祥物小章鱼（和应用图标同一只），Codex 是终端提示符
 const SPRITES = {
@@ -151,7 +191,7 @@ const toolColor = (tool) => cssVar(tool === "claude" ? "--series-2" : "--series-
 // 超过两周没有新数据的分组（例如以前用过的别的账号、旧方案），以及在「数据管理」里设为只保留的，不在监控里显示
 const isLive = (g) => now() - g.last_seen < 14 * 86400 && g.status !== "ignored";
 
-// 线条小图标（16×16）：已花用一摞钱币，外部消耗用饼图。内容是写死的常量，不含外部数据
+// 线条小图标（16×16）：金额用一摞钱币，饼图备用。内容是写死的常量，不含外部数据
 const ICONS = {
   coins: '<ellipse cx="8" cy="4" rx="5.5" ry="2"/><path d="M2.5 4v8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2V4"/>' +
     '<path d="M2.5 8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2"/>',
@@ -293,14 +333,24 @@ function renderWindowRow(w, tNow = now()) {
     ? h("div", { class: projected > 100 ? "proj over" : "proj",
       style: `left:${Math.min(100, pct)}%;width:${(Math.min(100, projected) - Math.min(100, pct)).toFixed(1)}%` })
     : null;
+  // 金额取额度快照那一刻的累计，和百分比同一时间点；快照之后的新花费单独提示
+  const later = Math.max(0, (w.cost_so_far || 0) - (w.cost_at_snapshot || 0));
+  const estimable = w.quality === "conditional" && w.cap;
+  const reasons = (w.reasons || []).map(reasonText);
+  const capTip = t("按当前使用构成估算，整个窗口用满大约值多少") + (w.claimed ? t("；基于你的覆盖声明") : "") +
+    (w.bias_pct ? t("；别的来源约占 {pct}%，估值可能偏低", { pct: Math.round(w.bias_pct) }) : "");
   const facts = [
-    h("span", { class: "fact", title: t("这个窗口里本地用掉的模型，按官方 API 价折算；约值 = 整个窗口用满大约值多少") },
-      icon("coins"), t("已花"), h("strong", {}, usd(w.cost_so_far)),
-      w.cap ? h("span", { class: "of" }, t("/ 约值 {cap}", { cap: usd(w.cap) })) : null),
-    w.external_pct >= 1 ? h("span", { class: "fact", title: t("本地日志以外的消耗：别的设备、云任务或网页聊天") },
-      icon("pie"), t("外部消耗 {pct}%", { pct: w.external_pct.toFixed(0) })) : null,
+    h("span", { class: "fact", title: t("本机日志里的用量按官方 API 价折算，截至 {when} 的额度快照。不是实际扣费，也不含别的设备",
+      { when: clock(w.snapshot_at || tNow) }) },
+      icon("coins"), t("本机 API 等价"), h("strong", {}, usd(w.cost_at_snapshot || 0)),
+      estimable ? h("span", { class: "of", title: capTip }, t("/ 用满{range}", { range: capRange(w) })) : null),
+    later >= 0.01 ? h("span", { class: "fact muted", title: t("额度快照之后的新花费，等额度更新后再算进比例") },
+      t("+{usd} 待额度更新", { usd: usd(later) })) : null,
+    w.quality && !estimable
+      ? h("span", { class: `fact quality ${w.quality}`, title: reasons.join("\n") }, qualityName(w.quality)) : null,
     w.status ? h("span", { class: `fact state ${w.status}` }, stateName(w.status)) : null,
   ];
+  const sources = w.sources ? sourceList(w.sources) : null;
   return h("div", { class: "win" },
     h("div", { class: "win-row" }, label,
       h("div", { class: "gauge", role: "meter", "aria-valuenow": pct, "aria-valuemin": 0, "aria-valuemax": 100,
@@ -313,7 +363,18 @@ function renderWindowRow(w, tNow = now()) {
       h("span", { class: "win-pct" }, pct.toFixed(0), h("small", {}, "%"))),
     h("div", { class: "win-meta" }, h("span", {}, t("{span}后重置", { span: span(w.end - tNow) })), forecast,
       h("span", { class: "left" }, t("剩余 {pct}%", { pct: Math.max(0, 100 - pct).toFixed(0) }))),
-    h("div", { class: "win-foot" }, facts));
+    h("div", { class: "win-foot" }, facts), sources);
+}
+
+// Claude 周窗口：已用部分来自哪些产品（官方分项，占已用部分的比例）
+function sourceList(src) {
+  const rows = (src.rows || []).filter((r) => r.percent > 0);
+  if (!rows.length) return null;
+  return h("details", { class: "sources" },
+    h("summary", {}, t("已用部分来源"),
+      h("span", { class: "muted" }, " · " + t("{when}更新", { when: ago(src.last_as_of || src.as_of) }))),
+    h("ul", {}, rows.map((r) => h("li", {}, h("span", {}, t(r.display_name || r.key)), h("strong", {}, `${Math.round(r.percent)}%`)))),
+    h("small", { class: "muted" }, t("Claude Code 一项分不出是哪台设备；只有本机的 Claude Code 能被采集。")));
 }
 
 function renderNow(overview) {
@@ -349,6 +410,15 @@ function renderMonitor(monitor) {
       h("div", { class: "card-head" },
         h("h3", {}, sprite(g.tool), `${TOOL_NAMES[g.tool]} · ${windowLabel(g)}`),
         h("span", { class: `stamp ${status}`, title: stateName(status) }, t(STAMPS[status] || status))));
+    // 没有满足估值条件的窗口：偏离仪和小图都是金额估值，一并不显示，只说明原因
+    if (g.ref_model && g.fit_basis !== "conditional") {
+      card.append(h("p", { class: "note" },
+        t("还没有满足估值条件的窗口，暂不显示容量估值。打开设置里的覆盖声明后，之后开始的窗口可以估值。")));
+      const note = monitorNote(g, status);
+      if (note) card.append(note);
+      box.append(card);
+      continue;
+    }
     if (g.ref_model) {
       const value = g.recent_median ?? g.ref_cap;
       // 收紧是坏消息（红），放宽是好消息（绿），稳定不着色
@@ -380,6 +450,11 @@ function renderMonitor(monitor) {
 
 // 跨断档、换代时，说清楚这次是和什么比的
 function monitorNote(g, status) {
+  if (status === "not_eligible") {
+    const why = Object.keys(g.blocked || {}).map((code) => reasonText({ code })).join(t("；"));
+    return h("p", { class: "note warn" }, t("最近或基线窗口不满足估值条件，这次不判断有没有被调。"),
+      why ? t("原因：{why}", { why }) : "");
+  }
   if (status === "model_changed") {
     const rough = g.raw_ratio != null
       ? t("按 API 等价金额粗看，一个窗口之前约 {before}、现在约 {after}（{pct}），仅供参考。",
@@ -431,7 +506,7 @@ function deviationGauge(g, status) {
     const dots = (label, have, need) => h("span", { class: "samples" }, label,
       h("span", {}, Array.from({ length: need }, (_, i) => h("i", { class: i < have ? "on" : null }))),
       `${Math.min(have || 0, need)}/${need}`);
-    el.append(h("div", { class: "dev-wait", title: t("参与判断的窗口：用量 10% 以上、没被外部消耗污染") },
+    el.append(h("div", { class: "dev-wait", title: t("参与判断的窗口：用量 10% 以上、满足估值条件") },
       dots(g.window === "five_hour" ? t("最近 3 天") : t("最新"), g.recent_n, needRecent),
       dots(t("之前"), g.baseline_n, needBase)));
   }
@@ -492,7 +567,7 @@ function drawTrend(node, g, events) {
   const bm = g.baseline_median, th = g.threshold || 0.2;
   const tip = (p) => {
     const why = p.excluded ? t("你手动排除了，不参与判断")
-      : p.contaminated ? t("外部消耗约 {pct}%，未参与判断", { pct: p.external_pct.toFixed(0) })
+      : p.quality && p.quality !== "conditional" ? t("{quality}，未参与判断", { quality: qualityName(p.quality) })
         : !p.in_trend ? t("用量太少，未参与判断")
           : p.role === "baseline" && g.cross_gap ? t("断档前的基线窗口") : "";
     return `<strong>${usd(p.value)}</strong><br>${esc(t("{start} 起 · 已用 {pct}%", { start: when(p.start), pct: p.pct.toFixed(0) }))}` +
@@ -568,8 +643,19 @@ async function showDetail(w) {
     return [p.pct, +p.cost.toFixed(4), s.ts, s.external];
   });
   const ext = jumps.reduce((a, j) => a + j[3], 0);
-  $("#detail-note").textContent = t("已用 {pct}% · 花费 {cost}", { pct: d.used_percent.toFixed(0), cost: usd(d.cost_at_snapshot) }) +
-    (d.cap ? t(" · 约值 {cap}", { cap: usd(d.cap) }) : "") + (jumps.length ? t(" · 外部消耗约 {pct}%", { pct: ext.toFixed(0) }) : "");
+  // 分子、分母、截止时间都给出来，用户可以自己复算
+  $("#detail-note").textContent = t("截至 {when}：本机 API 等价 {cost} ÷ 已用 {pct}%",
+    { when: when(d.snapshot_at || d.last_seen), cost: usd(d.cost_at_snapshot), pct: d.used_percent.toFixed(0) }) +
+    (d.quality === "conditional" && d.cap ? t(" ≈ 用满{range}", { range: capRange(d) }) : "") +
+    (d.unsegmented_pct >= 1 ? t(" · 开始监测前已用的 {pct}% 没有分步记录", { pct: d.unsegmented_pct.toFixed(0) }) : "") +
+    (jumps.length ? t(" · 疑似未记录消耗约 {pct}%（未扣除）", { pct: ext.toFixed(0) }) : "");
+  const quality = $("#detail-quality");
+  quality.replaceChildren();
+  if (d.quality) {
+    quality.append(h("strong", { class: `quality ${d.quality}` }, qualityName(d.quality)),
+      d.claimed && d.quality === "conditional" ? h("span", { class: "muted" }, " · " + t("基于你的覆盖声明")) : null,
+      d.reasons?.length ? h("ul", {}, d.reasons.map((r) => h("li", {}, reasonText(r)))) : null);
+  }
   const btn = $("#detail-exclude");
   btn.textContent = d.excluded ? t("恢复参与判断") : t("不让这个窗口参与判断");
   btn.title = t("比如这个窗口里你在别的设备上也用过、或者有别的异常。数据本身不删，随时可以恢复");
@@ -577,7 +663,7 @@ async function showDetail(w) {
     await toggleWindow(w.tool, d.key, !d.excluded);
     await showDetail(w);
   };
-  const names = { cost: t("累计花费"), jump: t("外部消耗跳涨") };
+  const names = { cost: t("累计花费"), jump: t("疑似未记录消耗") };
   render($("#detail-chart"), {
     textStyle: b.textStyle,
     grid: { left: 52, right: 56, top: 30, bottom: 28 },
@@ -586,7 +672,7 @@ async function showDetail(w) {
       formatter: (it) => {
         const [pct, cost, ts, extPct] = it.data;
         return `<strong>${usd(cost)}</strong><br>${esc(t("已用 {pct}% · {when}", { pct, when: when(ts) }))}` +
-          (extPct ? `<br>${esc(t("约 {pct}% 来自本地日志以外", { pct: extPct.toFixed(0) }))}` : "");
+          (extPct ? `<br>${esc(t("额度多涨约 {pct}%，本机没有对应记录", { pct: extPct.toFixed(0) }))}` : "");
       } },
     xAxis: { type: "value", min: 0, max: Math.max(10, Math.ceil((d.used_percent || 0) / 10) * 10), ...b.axis,
       name: t("已用"), nameTextStyle: { color: b.muted }, axisLabel: { ...b.axis.axisLabel, formatter: "{value}%" } },
@@ -790,17 +876,18 @@ function renderEvents(events) {
 function renderWindowTable(rows) {
   const table = $("#window-table");
   table.replaceChildren(h("tr", {},
-    h("th", {}, t("窗口")), h("th", {}, t("开始")), h("th", {}, t("已用")), h("th", {}, t("外部消耗")), h("th", {}, t("等价花费")),
-    h("th", {}, t("推算上限")), h("th", {}, t("折合主力模型")), h("th", { class: "text" }, t("参与判断")), h("th", {}, "")));
+    h("th", {}, t("窗口")), h("th", {}, t("开始")), h("th", {}, t("已用")), h("th", {}, t("估值条件")), h("th", {}, t("本机 API 等价")),
+    h("th", {}, t("用满估算")), h("th", {}, t("折合主力模型")), h("th", { class: "text" }, t("参与判断")), h("th", {}, "")));
   const shown = rows.filter((r) => r.supported && r.used_percent > 0);
   for (const r of shown) {
-    const why = r.excluded ? t("否（你排除了）") : r.in_trend ? t("是") : r.contaminated ? t("否（外部消耗多）") : t("否");
+    const why = r.excluded ? t("否（你排除了）") : r.in_trend ? t("是")
+      : r.quality && r.quality !== "conditional" ? t("否（{quality}）", { quality: qualityName(r.quality) }) : t("否");
     table.append(h("tr", { class: r.excluded ? "clickable excluded" : "clickable",
       onclick: () => showDetail(r).then(() => $("#detail").scrollIntoView({ behavior: "smooth" })) },
       h("td", {}, `${windowLabel(r)}${r.plan_type ? " · " + r.plan_type : ""}`), h("td", {}, when(r.start)),
       h("td", {}, `${r.used_percent.toFixed(0)}%`),
-      h("td", {}, r.external_pct >= 1 ? `${r.external_pct.toFixed(0)}%` : "—"),
-      h("td", {}, usd(r.cost_at_snapshot)), h("td", {}, r.cap ? usd(r.cap) : "—"),
+      h("td", { class: "text", title: (r.reasons || []).map(reasonText).join("\n") }, r.quality ? qualityName(r.quality) : "—"),
+      h("td", {}, usd(r.cost_at_snapshot)), h("td", {}, r.quality === "conditional" && r.cap ? capRange(r) : "—"),
       h("td", {}, r.value ? usd(r.value) : "—"),
       h("td", { class: "text" }, why),
       h("td", {}, h("button", { type: "button", class: "mini", title: t("数据不删，只是不参与汇率、趋势和告警"),
@@ -982,7 +1069,45 @@ function renderSettings(s) {
   }
   form.append(h("div", { class: "settings-actions" }, h("button", { type: "submit" }, t("保存")),
     h("span", { id: "settings-saved", class: "muted" })));
-  $("#settings-panel").replaceChildren(form);
+  $("#settings-panel").replaceChildren(form, h("div", { id: "coverage-panel", class: "coverage" }));
+  loadCoverage();
+}
+
+// 覆盖声明：每个工具、每个账号分别声明，从打开时起生效，不追认过去
+const COVERAGE_HELP = {
+  claude: "如果这个账号只在这台电脑上用 Claude Code，不用 claude.ai 网页、手机 App、桌面版聊天或 Cowork，也没有别的电脑或云任务在用，就可以打开。",
+  codex: "如果这个账号只在这台电脑上用 Codex，没有别的电脑、云任务或网页版在用，就可以打开。",
+};
+
+async function loadCoverage() {
+  const cov = await api("/api/coverage");
+  const box = $("#coverage-panel");
+  if (!box) return;
+  box.replaceChildren(h("h3", {}, t("覆盖声明")),
+    h("p", { class: "muted" }, t("声明「这个账号在声明期间，所有消耗这份额度的使用都会被本项目采集到」。打开后，之后开始的窗口可以显示容量估值和收紧提示；之前的窗口不受影响。数据显示有别的来源时以数据为准，不估值。")));
+  for (const tool of Object.keys(TOOL_NAMES)) {
+    const c = cov[tool];
+    if (!c) continue;
+    const state = !c.account_known ? t("读不到当前账号，暂时不能声明。")
+      : c.on ? t("已打开，{when} 起生效。", { when: when(c.since) })
+        : c.other_account ? t("之前的声明属于别的账号，切换账号后需要重新确认。")
+          : t("未打开。");
+    const input = h("input", { type: "checkbox", checked: c.on ? "" : null, disabled: !c.account_known && !c.on ? "" : null,
+      onchange: async (e) => {
+        e.target.disabled = true;
+        try {
+          await post("/api/coverage", { tool, on: e.target.checked });
+        } catch (err) {
+          alert(t(err.message));
+        } finally {
+          await loadCoverage();
+          loadAll();
+        }
+      } });
+    box.append(h("label", { class: "field checkbox" },
+      h("span", {}, t("{tool}：这个账号的使用都被本项目采集", { tool: TOOL_NAMES[tool] })), input,
+      h("small", {}, t(COVERAGE_HELP[tool]) + " " + state)));
+  }
 }
 
 async function saveSettings(e) {
