@@ -138,7 +138,18 @@ function reasonText(r) {
   }
 }
 
-const capRange = (w) => t("约 {low}～{high}", { low: usd(w.cap_low), high: usd(w.cap_high) });
+// 5 小时窗口刚开始时，周额度只涨了几个整数点，取整误差占比大，区间会宽得没意义：只给中间值，等用量多了再给区间
+const RANGE_MIN_WEEKLY = 5;
+const RANGE_MAX_SPREAD = 1.5;
+const rangeTooWide = (w, e) =>
+  w.cap_high > w.cap_low * RANGE_MAX_SPREAD ||
+  (e && e.basis === "window_delta" && e.weekly_delta < RANGE_MIN_WEEKLY);
+const capRange = (w, e = w.estimate) => rangeTooWide(w, e) && w.cap
+  ? t("约 {usd}", { usd: usd(w.cap) })
+  : t("约 {low}～{high}", { low: usd(w.cap_low), high: usd(w.cap_high) });
+const RANGE_EARLY_TIP = "窗口刚开始，用量还少，误差区间偏宽（{low}～{high}），只显示中间值；继续使用后会给出区间";
+const rangeTip = (w, e = w.estimate) => rangeTooWide(w, e)
+  ? t(RANGE_EARLY_TIP, { low: usd(w.cap_low), high: usd(w.cap_high) }) : null;
 
 // 像素小图标，16×10 格：X 是主色，o 是眼睛。Claude 是吉祥物小章鱼（和应用图标同一只），Codex 是终端提示符
 const SPRITES = {
@@ -347,7 +358,8 @@ function renderWindowRow(w, tNow = now()) {
   const estimable = w.quality === "conditional" && w.cap;
   const reasons = (w.reasons || []).map(reasonText);
   const capTip = t("按当前使用构成估算，整个窗口用满大约值多少") + (w.claimed ? t("；基于你的覆盖声明") : "") +
-    (w.bias_pct ? t("；别的来源约占 {pct}%，估值可能偏低", { pct: Math.round(w.bias_pct) }) : "");
+    (w.bias_pct ? t("；别的来源约占 {pct}%，估值可能偏低", { pct: Math.round(w.bias_pct) }) : "") +
+    (rangeTip(w) ? "。" + rangeTip(w) : "");
   const facts = [
     h("span", { class: "fact", title: t("本机日志里的用量按官方 API 价折算，截至 {when} 的额度快照。不是实际扣费，也不含别的设备",
       { when: clock(w.snapshot_at || tNow) }) },
@@ -394,7 +406,7 @@ function estimateFact(e) {
   ].filter(Boolean).join("\n");
   return h("span", { class: "fact", title: tip },
     t("含推测 ≈ {usd}", { usd: usd(e.total) }) + (e.conflict_pct ? " ⚠" : ""),
-    h("span", { class: "of" }, t("/ 用满{range}", { range: t("约 {low}～{high}", { low: usd(e.cap_low), high: usd(e.cap_high) }) })));
+    h("span", { class: "of", title: rangeTip(e, e) || tip }, t("/ 用满{range}", { range: capRange(e, e) })));
 }
 
 // Claude 周窗口：已用部分来自哪些产品（官方分项，占已用部分的比例）

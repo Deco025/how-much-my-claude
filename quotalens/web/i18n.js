@@ -355,6 +355,8 @@ const EN = {
   "确定：本机 Claude Code 日志按官方 API 价 {usd}（占已用部分的 {pct}%）": "Known: local Claude Code logs at official API prices, {usd} ({pct}% of the used part)",
   "这个窗口里没有汇率的模型花费太多，折算不成主力模型，不参与比较": "Too much of this window's spending is on models without a fitted rate, so it can't be converted to the main model; left out of the comparison",
   "额度涨幅超出本机和其他来源能解释的部分，估值可能偏低，不参与比较": "The quota rose more than local and other sources explain, so the estimate may be low; left out of the comparison",
+  "约 {usd}": "~{usd}",
+  "窗口刚开始，用量还少，误差区间偏宽（{low}～{high}），只显示中间值；继续使用后会给出区间": "The window has just started and usage is still low, so the error range is wide ({low}–{high}); only the middle value is shown. A range appears as you keep using it",
   "推测": "Inferred",
   "（推测）": " (inferred)",
   "没有覆盖声明：估值里推测了其他来源的花费，结论仅供参考": "No coverage declaration: the estimate infers spending from other sources, so treat this as a rough read",
