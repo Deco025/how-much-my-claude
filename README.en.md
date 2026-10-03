@@ -17,15 +17,6 @@ Turns your Codex CLI and Claude Code subscription usage into API-equivalent doll
 
 </div>
 
-<p align="center">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/story-en-dark.gif">
-  <img alt="Animation: the mascot codes until the 5-hour quota is used up, rests, then writes a novel; the same amount of work runs out early and the tool flags a possible tightening" src="docs/images/story-en-light.gif" width="584">
-</picture>
-</p>
-
-<p align="center"><sub>Same amount of work, but the second 5-hour window runs out early: "Spent $28.6 / worth ~$40.9" doesn't add up, so the tool flags it as possibly tightened.<br>The numbers are made up.</sub></p>
-
 ## What it tells you
 
 - **What a window is worth**: how many dollars of API usage each 5-hour and weekly window holds, down to each model — the same $1 can use up very different amounts of quota on different models.
