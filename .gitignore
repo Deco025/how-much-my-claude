@@ -8,9 +8,8 @@ tools/icon_preview.png
 build/
 dist/
 .venv/
-# 宣传动画、源码和录制工具，只留在本地
+# 宣传动画的源码和录制工具，只留在本地；README 展示 GIF 保留在仓库
 /promo/
-/docs/images/story-*.gif
 
 # 本地方案、评审和交接文档
 /用量估算改进方案.md

@@ -17,6 +17,15 @@
 
 </div>
 
+<p align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/story-zh-dark.gif">
+  <img alt="动画：吉祥物敲代码用满 5 小时额度，休息后写小说，同样的工作量却提前用满，工具判为疑似收紧" src="docs/images/story-zh-light.gif" width="584">
+</picture>
+</p>
+
+
+
 ## 它能告诉你什么
 
 - **一个窗口值多少钱**：5 小时、每周窗口各自折合多少美元的 API 用量，还能拆到每个模型——同样花 $1，不同模型吃掉的额度可以差好几倍。
