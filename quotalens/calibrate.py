@@ -59,7 +59,8 @@ KNOWN_UNCOLLECTED = {"chat", "cowork"}  # 已知、但本项目采集不到的�
 
 # 窗口质量状态，严重的在前
 QUALITY = ["incomplete", "source_unknown", "aligning", "waiting", "unconfirmed", "conditional"]
-ANALYSIS_VERSION = 2       # 1 = 扣除推测的外部消耗；2 = 不扣除，加估值条件
+ANALYSIS_VERSION = 4       # 1 = 扣除推测的外部消耗；2 = 不扣除，加估值条件；3 = 周分项历史从原始响应补全；
+                           # 4 = 趋势改用每个窗口的估值（确定 + 推测），不再要求覆盖声明；可设分析起点
 
 MIN_CHANGE = 0.20        # 低于这个幅度的变化不报（单窗口噪声约 ±20%）
 CHANGE_Z = 2.5
@@ -181,7 +182,7 @@ def _build_window(conn, tool, inst, now):
         "points": points, "_steps": steps, "_vec": cum,
         "external_pct": 0.0, "pct_clean": running, "contaminated": False,
         "unsegmented_pct": steps[0]["dpct"] if steps and steps[0]["unsegmented"] else 0.0,
-        "quality": None, "reasons": [], "claimed": False, "bias_pct": None, "sources": None,
+        "quality": None, "reasons": [], "claimed": False, "bias_pct": None, "sources": None, "estimate": None,
         "cap": None, "cap_low": None, "cap_high": None, "confidence": None,
         "value": None, "index": None, "in_trend": False,
         # 窗口键：首次看到的重置时间不随后续快照漂移，用来记住用户「不参与分析」的选择
@@ -299,6 +300,122 @@ def _set_cap(w):
         w["cap_low"] = cost / ((pct + 0.5) / 100)
         w["cap_high"] = cost / ((pct - 0.5) / 100)
         w["confidence"] = confidence(pct)
+
+
+ESTIMATE_MIN_CODE = 20     # Code 占比低于这个 %，推测部分是确定部分的 4 倍以上，不再给总量
+ESTIMATE_MIN_CODE_LOW = 10  # 考虑取整误差后 Code 占比的下限低于这个 %，区间上沿没有意义，也不给
+ESTIMATE_BLOCKERS = {"breakdown_invalid", "breakdown_stale", "collect_gap", "suspect_unrecorded", "aligning"}
+SPLIT_MAX_GAP = 1800       # 5h 拆分：窗口起止离最近一组周分项最多这么久（秒）
+SPLIT_MIN_WEEKLY = 3       # 窗口期间周% 至少涨这么多才拆（周% 和分项都是整数，涨得太少分不清）
+SPLIT_START_PCT = 5        # 窗口开始前没有分项时，用窗口内第一组分项当起点，要求那时 5h 已用不超过这个 %
+POLL_PAIR = 10             # 分项的 as_of 是服务器时间，和同一次查询的本机快照时刻差几秒（实测 -6.5～+4.5）
+ESTIMATE_CONFLICT = 3      # 无本机日志的涨幅比非 Code 能解释的还多这么多 %：Code 可能也在别的设备上用过
+
+
+def _weekly_samples(weeks, ctx):
+    """周分项 × 周已用% → 时间线：每个时刻的周%、非 Code 百分点（非 Code 占比 × 周%）及其取整误差。"""
+    out = []
+    for w in weeks:
+        for b in ctx["breakdowns"]:
+            if b["invalid"] or not _same_week(b, w):
+                continue
+            # [as_of, last_as_of] 期间每次查询的占比都没变：这段里的每个周% 快照都能算出非 Code 百分点
+            ts = {b["as_of"], b["last_as_of"]} | {p["ts"] for p in w["points"] if b["as_of"] <= p["ts"] <= b["last_as_of"]}
+            for t in ts:
+                wpct = _pct_at(w["points"], t + POLL_PAIR)   # 配同一次查询的周%，而不是上一次的
+                if wpct is None:
+                    continue
+                out.append({"t": t, "week": w["start"], "w": wpct, "pp": b["noncode"] / 100 * wpct,
+                            "err": b["noncode_err"] / 100 * wpct + 0.5 * b["noncode"] / 100})
+    out.sort(key=lambda x: x["t"])
+    return out
+
+
+def _window_split(w, samples):
+    """5 小时窗口里 Code 占多少：看同一段时间周额度涨了多少、其中多少是非 Code 涨的。
+
+    5h% 和周% 由同一批用量推动，所以窗口内非 Code 的份额 ≈ 非 Code 百分点增量 / 周% 增量
+    （真实数据回放：只用 Code 的窗口每 1% 约 $0.39，按此拆出的混用窗口约 $0.42）。
+    返回 {"code", "code_low", "code_high", "weekly_delta", "noncode_delta", "from", "to"}，拆不了返回 None。
+    """
+    end = [x for x in samples if w["start"] < x["t"] <= w["last_seen"] + 60]
+    if not end or w["last_seen"] - end[-1]["t"] > SPLIT_MAX_GAP:
+        return None
+    s1 = end[-1]
+    before = [x for x in samples if x["t"] <= w["start"]]
+    if before and w["start"] - before[-1]["t"] <= SPLIT_MAX_GAP:
+        s0, h0 = before[-1], 0.0
+    else:
+        s0 = end[0] if end[0] is not s1 else None
+        h0 = _pct_at(w["points"], s0["t"]) if s0 else None
+        if h0 is None or h0 > SPLIT_START_PCT:
+            return None
+    if s0["week"] == s1["week"]:
+        dw, dn = s1["w"] - s0["w"], s1["pp"] - s0["pp"]
+        errs = [s0["err"], s1["err"]]
+    else:   # 周额度在这段里重置：旧周涨的 + 新周从 0 涨的
+        e = [x for x in samples if x["week"] == s0["week"] and s0["t"] <= x["t"] <= s1["t"]][-1]
+        dw, dn = e["w"] - s0["w"] + s1["w"], e["pp"] - s0["pp"] + s1["pp"]
+        errs = [s0["err"], e["err"], s1["err"]]
+    if dw < SPLIT_MIN_WEEKLY:
+        return None
+    # 最坏情况：每个周% 都是取整值（±0.5），每个非 Code 百分点各自带取整误差，全部同向
+    ew, en = 0.5 * len(errs), sum(errs)
+    clamp = lambda x: min(1.0, max(0.0, x))
+    f, f_lo, f_hi = clamp(dn / dw), clamp((dn - en) / (dw + ew)), clamp((dn + en) / (dw - ew))
+    return {"code": 100 * (1 - f), "code_low": 100 * (1 - f_hi), "code_high": 100 * (1 - f_lo),
+            "weekly_delta": dw, "noncode_delta": dn, "from": s0["t"], "to": s1["t"]}
+
+
+def _set_estimate(w):
+    """Claude 窗口：总花费 = 确定（本机 Code 日志 × 官方价）+ 推测（其他来源按同样的额度/美元比例折算）。
+    周窗口的 Code 占比直接来自官方分项；5 小时窗口用窗口期间周分项的变化拆（见 _window_split）。
+    Codex 拿不到分项：假设这个账号的用量都在本机（Code 占 100%），无本机日志的涨幅由 suspect_unrecorded 拦下。
+    前提：Code 只在这台电脑上用；其他来源每 1% 额度和 Code 等价。和 cap 不同，不要求覆盖声明。
+    没有估值时把原因写进 w["_est_why"]，趋势卡片据此说明为什么不判断。"""
+    w["estimate"], w["_est_why"] = None, None
+    if not w["supported"]:
+        w["_est_why"] = "unsupported"
+        return
+    if w.get("tool") == "codex":
+        code = code_low = code_high = 100.0
+        basis, extra = "local_only", {}
+    elif w["window"] == "seven_day" and w.get("sources"):
+        code = w["sources"]["code"]
+        code_low, code_high, basis, extra = max(0.0, code - 0.5), min(100.0, code + 0.5), "breakdown", {}
+    elif w["window"] == "five_hour" and w.get("_split"):
+        sp = w["_split"]
+        code, code_low, code_high, basis = sp["code"], sp["code_low"], sp["code_high"], "window_delta"
+        extra = {"weekly_delta": sp["weekly_delta"], "noncode_delta": sp["noncode_delta"]}
+    else:
+        w["_est_why"] = "no_split" if w["window"] == "five_hour" else "no_breakdown"
+        return
+    # 有来源分项（Claude）时，无本机日志的涨幅本来就应该来自网页、App、Cowork，不按「疑似未记录」拦，
+    # 超出非 Code 能解释的部分另由 conflict_pct 判断；只有 Codex（假设全在本机）才按它拦
+    skip = set() if basis == "local_only" else {"suspect_unrecorded"}
+    blocker = next((r["code"] for r in w["reasons"] if r.get("code") in ESTIMATE_BLOCKERS - skip), None)
+    if blocker:
+        w["_est_why"] = blocker
+        return
+    pct, cost = w["used_percent"], w["cost_at_snapshot"]
+    if pct < MIN_FIT_PCT or cost <= 0:
+        w["_est_why"] = "too_little"
+        return
+    if code < ESTIMATE_MIN_CODE or code_low < ESTIMATE_MIN_CODE_LOW:
+        w["_est_why"] = "code_share_low"
+        return
+    total = cost * 100 / code
+    # 无本机日志的涨幅（external_pct）本该都是非 Code；比非 Code 最多能解释的还多，说明前提可能不成立，估值偏低
+    conflict = w.get("external_pct", 0.0) - (100 - code_low) / 100 * pct
+    w["estimate"] = {
+        "basis": basis, **extra, "conflict_pct": conflict if conflict >= ESTIMATE_CONFLICT else 0.0,
+        "local": cost, "inferred": total - cost, "total": total,
+        "total_low": cost * 100 / code_high, "total_high": cost * 100 / code_low,
+        "code_pct": code, "noncode_pct": 100 - code, "code_low": code_low, "code_high": code_high,
+        "cap": total / (pct / 100),
+        "cap_low": cost * 1e4 / ((pct + 0.5) * code_high),
+        "cap_high": cost * 1e4 / ((pct - 0.5) * code_low),
+    }
 
 
 # ── 估值条件：覆盖声明、采集缺口、来源分项 ─────────────────
@@ -613,8 +730,8 @@ def _change_status(trend, window_seconds, now, params=DEFAULT_PARAMS):
     overlap, before, after = _model_overlap(recent, baseline)
     out.update(model_overlap=overlap, model_before=before, model_after=after)
     if overlap < params["model_overlap"]:
-        raw_r = [w["cap"] for w in recent if w["cap"]]
-        raw_b = [w["cap"] for w in baseline if w["cap"]]
+        raw_r = [w["estimate"]["cap"] for w in recent if w["estimate"]]
+        raw_b = [w["estimate"]["cap"] for w in baseline if w["estimate"]]
         if raw_r and raw_b:
             out.update(raw_recent=statistics.median(raw_r), raw_baseline=statistics.median(raw_b))
             out["raw_ratio"] = out["raw_recent"] / out["raw_baseline"]
@@ -654,6 +771,7 @@ def _analyze_group(windows, now, params=DEFAULT_PARAMS, assess=_no_assess):
             assess(w)
     for w in windows:
         _set_cap(w)
+        _set_estimate(w)
 
     group = {"ref_model": None, "ref_cap": None, "rates": [], "fit_windows": 0, "median_error_pct": None,
              "fit_basis": basis if fit else None, "analysis_version": ANALYSIS_VERSION}
@@ -675,20 +793,38 @@ def _analyze_group(windows, now, params=DEFAULT_PARAMS, assess=_no_assess):
         if spend:
             ref = max(spend, key=spend.get)
             group["ref_model"], group["ref_cap"] = ref[0], 100 / fit["rates"][ref]
-        if spend and basis == "conditional":
-            in_range = {id(w) for w in fit_set}
-            for w in windows:
-                expected, covered = _expected(w["_vec"], fit)
-                if (w["quality"] == "conditional" and expected > 0 and w["pct_clean"] > 0
-                        and covered / expected >= 0.7):
-                    w["index"] = w["pct_clean"] / expected
-                    w["value"] = group["ref_cap"] / w["index"]
-                    # 只有可作条件估计的窗口进趋势：声明前的窗口不会混进基线
-                    w["in_trend"] = (not w["excluded"]
-                                     and w["pct_clean"] >= MIN_TREND_PCT and id(w) in in_range)
+    # 趋势：每个窗口用自己的估值（用满约值多少美元，API 等价，确定 + 推测）。
+    # 不要求覆盖声明；分析起点之前的窗口（采集方式不同的旧数据）不参与
+    # 有主力模型时按拟合汇率把每个窗口的估值折算成「全用主力模型」的金额，模型组合的变化（例如便宜模型的
+    # 占比变大）不会被当成额度变化；某个窗口里没有汇率的花费太多，折算不可靠，这个窗口不进趋势。
+    # 估值和本机记录冲突（conflict_pct > 0，估值偏低）的窗口也不进趋势，免得把结论推向「收紧」
+    since = params.get("since") or 0
+    in_range = {id(w) for w in fit_set}
+    ref = (group["ref_model"], "usd") if group["ref_model"] else None
+    group["value_model"] = group["ref_model"]
+    for w in windows:
+        est = w["estimate"]
+        if est is None:
+            continue
+        w["value"] = est["cap"]
+        if ref:
+            usd = {k: v for k, v in w["_vec"].items() if k[1] == "usd"}
+            expected, covered = _expected(usd, fit)
+            local = sum(usd.values())
+            if local > 0 and expected > 0 and covered / expected >= 0.7:
+                w["value"] = est["cap"] * (expected / fit["rates"][ref]) / local
+            else:
+                w["value"], w["_est_why"] = None, "model_unpriced"
+                continue
+        if est["conflict_pct"] > 0:
+            w["_est_why"] = "estimate_conflict"
+        w["in_trend"] = (not w["excluded"] and w["start"] >= since and not est["conflict_pct"]
+                         and w["used_percent"] >= MIN_TREND_PCT and id(w) in in_range)
+    group["since"] = since
+    group["estimated_n"] = sum(1 for w in windows if w["in_trend"])   # 能参与比较的窗口数
     trend = [w for w in windows if w["in_trend"]]
     group.update(_change_status(trend, windows[0]["window_seconds"], now, params))
-    _eligibility(group, usable, windows[0]["window_seconds"], now)
+    _eligibility(group, usable, windows[0]["window_seconds"], now, since)
     if basis != "conditional":
         # 观察拟合只说明大致比例，不能当成账号容量：金额类字段一律不输出
         group["ref_cap"] = None
@@ -697,26 +833,29 @@ def _analyze_group(windows, now, params=DEFAULT_PARAMS, assess=_no_assess):
     return group
 
 
-def _eligibility(group, usable, window_seconds, now):
-    """趋势资格：收紧/放宽只能来自基线和待检测窗口都满足估值条件的比较。
-    样本不够时区分「不可判断」（窗口有，但不满足条件）和「历史基线不足」（窗口本身就不够）。"""
-    # 独立复核：参与比较的窗口必须全部可作条件估计、各自数量够，才算有资格
+def _eligibility(group, usable, window_seconds, now, since=0):
+    """趋势资格：收紧/放宽只能来自基线和待检测窗口都有估值的比较。
+    样本不够时区分「不可判断」（窗口有，但没有估值）和「历史基线不足」（窗口本身就不够）。
+    declared：参与比较的窗口全部在覆盖声明下（估值里没有推测成分的前提）。只有这样的结论才写告警、弹通知；
+    其余结论只在页面上显示，标为「推测」。"""
+    # 独立复核：参与比较的窗口必须全部有估值、在分析起点之后、各自数量够，才算有资格
     compared = [w for w in usable if w["role"] in ("recent", "baseline")]
     rule = SHORT_RULE if window_seconds <= 6 * 3600 else LONG_RULE
     group["eligible"] = (group["status"] in ("stable", "tighter", "looser")
-                         and all(w["quality"] == "conditional" and w["in_trend"] for w in compared)
+                         and all(w["estimate"] is not None and w["in_trend"] for w in compared)
                          and sum(w["role"] == "recent" for w in compared) >= rule["min_recent"]
                          and sum(w["role"] == "baseline" for w in compared) >= rule["min_baseline"])
+    group["declared"] = group["eligible"] and all(w["quality"] == "conditional" for w in compared)
     group["blocked"] = {}
     if group["status"] != "insufficient":
         return
     cands = [w for w in usable if w["supported"] and w["used_percent"] >= MIN_TREND_PCT
-             and w["end"] >= now - ANALYSIS_DAYS * 86400]
+             and w["end"] >= now - ANALYSIS_DAYS * 86400 and w["start"] >= since]
     recent, baseline, older, rule = _split(cands, window_seconds, now)
-    blocked = [w for w in recent + baseline if w["quality"] != "conditional"]
+    blocked = [w for w in recent + baseline if w["estimate"] is None or w.get("_est_why")]
     for w in blocked:
-        for r in w["reasons"]:
-            group["blocked"][r["code"]] = group["blocked"].get(r["code"], 0) + 1
+        code = w.get("_est_why") or "no_estimate"
+        group["blocked"][code] = group["blocked"].get(code, 0) + 1
     if blocked and (len(recent) >= rule["min_recent"]
                     and max(len(baseline), len(older)) >= rule["min_baseline"]):
         group["status"] = "not_eligible"
@@ -751,6 +890,11 @@ def analyze(conn, tool, now=None, params=None):
     noncode = None
     if tool == "claude":
         noncode = _noncode_intervals([w for w in windows if w["window"] == "seven_day" and w["scope"] == "all"], ctx)
+        weeks = [w for w in windows if w["window"] == "seven_day" and w["scope"] == "all"]
+        samples = _weekly_samples(weeks, ctx)
+        for w in windows:
+            if w["window"] == "five_hour" and w["scope"] == "all":
+                w["_split"] = _window_split(w, samples)
 
     def assess(w):
         _assess(w, ctx, noncode)
@@ -761,7 +905,7 @@ def analyze(conn, tool, now=None, params=None):
     for (scope, window, plan), ws in by_key.items():
         group = _analyze_group(ws, now, params, assess) if ws[0]["supported"] else {"status": "unsupported", "rates": []}
         if rules["plans"].get(plan, (None,))[0] == "ignore":
-            group["status"], group["eligible"] = "ignored", False
+            group["status"], group["eligible"], group["declared"] = "ignored", False, False
         group.update(tool=tool, scope=scope, window=window, plan_type=plan, window_seconds=ws[0]["window_seconds"],
                      last_seen=max(w["last_seen"] for w in ws), latest_end=max(w["end"] for w in ws),
                      windows_n=len(ws))
@@ -770,7 +914,9 @@ def analyze(conn, tool, now=None, params=None):
                            "pct": w["used_percent"], "pct_clean": w["pct_clean"], "external_pct": w["external_pct"],
                            "contaminated": w["contaminated"], "in_trend": w["in_trend"], "cost": w["cost_at_snapshot"],
                            "excluded": w["excluded"], "role": w["role"], "key": w["key"],
-                           "quality": w["quality"], "claimed": w["claimed"]}
+                           "quality": w["quality"], "claimed": w["claimed"],
+                           "cap_low": w["estimate"]["cap_low"] if w["estimate"] else None,
+                           "cap_high": w["estimate"]["cap_high"] if w["estimate"] else None}
                           for w in ws if w["value"] is not None
                           and (w["end"] >= now - ANALYSIS_DAYS * 86400 or w["role"] == "baseline")]
         groups.append(group)

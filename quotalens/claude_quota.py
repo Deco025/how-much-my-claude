@@ -126,8 +126,13 @@ def store_breakdown(conn, breakdown, fetched_at) -> bool:
                              issues=breakdown.get("issues") or ())
 
 
-def backfill_breakdowns(conn) -> int:
-    """从归档的原始响应里补出历史分项（不重新请求接口）。返回新补的组数。"""
+def backfill_breakdowns(conn, rebuild=False) -> int:
+    """从归档的原始响应里补出历史分项（不重新请求接口）。返回新补的组数。
+
+    save_breakdown 只接受比已有记录更新的分项，所以已经有实时记录后要补更早的历史，得 rebuild：
+    清掉 Claude 分项、按时间顺序从原始响应全部重放（每次查询的原始响应都归档了，不会丢信息）。"""
+    if rebuild:
+        conn.execute("DELETE FROM source_breakdown WHERE tool = 'claude'")
     n = 0
     for r in conn.execute("SELECT first_ts, body FROM raw_response WHERE tool = 'claude' ORDER BY first_ts").fetchall():
         try:

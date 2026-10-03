@@ -53,7 +53,7 @@ def create_app(service: Service, on_show=None, on_quit=None) -> FastAPI:
         out = calibrate.public(w)
         out["remaining_if_only"] = []
         for key in ("ref_model", "ref_cap", "baseline_median", "recent_median", "status", "ratio", "threshold",
-                    "eligible", "blocked", "fit_basis"):
+                    "eligible", "declared", "blocked", "fit_basis", "since"):
             out[key] = group.get(key) if group else None
         # 「按某模型还能用多少钱」也是容量估值：只在窗口可作条件估计时给
         if not group or not w["active"] or w.get("quality") != "conditional" or group.get("fit_basis") != "conditional":
@@ -139,6 +139,7 @@ def create_app(service: Service, on_show=None, on_quit=None) -> FastAPI:
     @app.get("/api/settings")
     def get_settings():
         return {"values": service.settings, "defaults": settings.DEFAULTS, "limits": settings.LIMITS,
+                "default_since": settings.default_since(),
                 "data_dir": str(db.DATA_DIR)}
 
     @app.post("/api/settings")

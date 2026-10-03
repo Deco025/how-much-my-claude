@@ -38,6 +38,8 @@ class Service:
         """
         self.demo = demo
         db.init_db()
+        if not demo:
+            settings.ensure_observation_start()
         self.prices = PriceTable()
         self._overrides = {k: v for k, v in (("claude_poll_minutes", claude_poll_minutes),
                                               ("history_days", history_days), ("notify", notify_desktop))
@@ -52,6 +54,17 @@ class Service:
         self._activity = {"claude": 0.0, "codex": 0.0}
         self._analysis = None
         self.reprice_if_needed()
+        if not demo:
+            self.backfill_breakdowns_once()
+
+    def backfill_breakdowns_once(self):
+        """升级后第一次启动：从归档的原始响应重建 Claude 周分项历史（5 小时窗口拆分要用）。"""
+        with db.writer() as conn:
+            if db.get_meta(conn, "breakdown_backfill") == "1":
+                return
+            n = claude_quota.backfill_breakdowns(conn, rebuild=True)
+            db.set_meta(conn, "breakdown_backfill", "1")
+        log.info("从原始响应重建了 %d 组周分项", n)
 
     # ── 设置 ────────────────────────────────────────────
 
@@ -63,7 +76,8 @@ class Service:
         self.history_days = effective["history_days"]
         self.notify_desktop = effective["notify"]
         self.analysis_params = {"min_change": effective["min_change_pct"] / 100,
-                                "model_overlap": effective["model_overlap_pct"] / 100}
+                                "model_overlap": effective["model_overlap_pct"] / 100,
+                                "since": effective["analysis_since"] or settings.default_since()}
 
     def update_settings(self, changes):
         self.apply_settings(settings.save(changes))
@@ -208,9 +222,10 @@ class Service:
             for g in result["groups"]:
                 if g.get("status") not in ("tighter", "looser"):
                     continue
-                # 入库前再查一次资格：必须是当前算法版本、基线和待检测窗口都满足估值条件的结论。
-                # 旧分析结果或以后的改动不能绕过这里写出「收紧」记录
-                if not g.get("eligible") or g.get("analysis_version") != calibrate.ANALYSIS_VERSION:
+                # 入库前再查一次资格：必须是当前算法版本、基线和待检测窗口都有估值且都在覆盖声明下的结论。
+                # 含推测成分的结论只在页面上显示，不写告警、不弹通知；旧分析结果也不能绕过这里写出「收紧」记录
+                if (not g.get("eligible") or not g.get("declared")
+                        or g.get("analysis_version") != calibrate.ANALYSIS_VERSION):
                     continue
                 key = f"{g['scope']}:{g['window']}:{g['plan_type']}"
                 with db.writer() as conn:

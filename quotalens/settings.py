@@ -10,12 +10,14 @@ DEFAULTS = {
     "history_days": 90,         # 首次启动导入多久以内的日志（之后可以在「数据管理」里导入全部）
     "min_change_pct": 20,       # 偏离超过这么多才判为被调；这是下限，数据本身波动大时自动放宽
     "model_overlap_pct": 50,    # 最近窗口的花费里，前后共同在用的模型低于这个比例，就判为「换了模型」
+    "analysis_since": 0,        # 判断额度有没有被调只用这个时间（Unix 秒）之后开始的窗口；0 = 默认起点，见 default_since
 }
 LIMITS = {
     "claude_poll_minutes": (2, 240),
     "history_days": (7, 3650),
     "min_change_pct": (5, 60),
     "model_overlap_pct": (10, 90),
+    "analysis_since": (0, 4102444800),
 }
 CHOICES = {"language": ("auto", "zh", "en")}
 
@@ -37,6 +39,24 @@ def clean(values: dict) -> dict:
             lo, hi = LIMITS[key]
             out[key] = int(min(hi, max(lo, value)))
     return out
+
+
+def ensure_observation_start() -> None:
+    """第一次启动时记下正式观察开始的时间（已有就不动）。启动前导入的历史日志没有来源分项，不当默认起点。"""
+    import time
+    with db.writer() as conn:
+        if not db.get_meta(conn, "observation_start"):
+            db.set_meta(conn, "observation_start", str(time.time()))
+
+
+def default_since() -> float:
+    """分析起点的默认值：正式观察开始的时间（meta.observation_start，第一次启动时记下）。"""
+    try:
+        with db.reader() as conn:
+            value = db.get_meta(conn, "observation_start")
+        return float(value) if value else 0.0
+    except (ValueError, TypeError):
+        return 0.0
 
 
 def load() -> dict:

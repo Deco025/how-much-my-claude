@@ -127,6 +127,13 @@ function reasonText(r) {
     case "claim_after_start": return t("覆盖声明在这个窗口开始之后才打开");
     case "claim_ended": return t("这个窗口开始时覆盖声明已经关闭");
     case "claim_conflict": return t("你声明了覆盖完整，但数据显示有别的来源，以数据为准");
+    case "too_little": return t("用量还太少，变化不足以估算");
+    case "code_share_low": return t("Claude Code 占比太低，推测部分太大，不给估值");
+    case "no_split": return t("这个 5 小时窗口附近没有来源分项，分不出 Claude Code 占多少");
+    case "unsupported": return t("这个窗口不支持估值");
+    case "no_estimate": return t("这个窗口没有估值");
+    case "model_unpriced": return t("这个窗口里没有汇率的模型花费太多，折算不成主力模型，不参与比较");
+    case "estimate_conflict": return t("额度涨幅超出本机和其他来源能解释的部分，估值可能偏低，不参与比较");
     default: return r.code;
   }
 }
@@ -292,12 +299,14 @@ function renderConnections(conns) {
 function renderBanner(monitor) {
   const box = $("#alert-banner");
   box.replaceChildren();
-  for (const g of monitor.groups.filter((x) => isLive(x) && (x.status === "tighter" || x.status === "looser"))) {
+  // 只有够资格的结论才上横幅；不在覆盖声明下的（估值里有推测成分）标「推测」
+  for (const g of monitor.groups.filter((x) => isLive(x) && x.eligible && (x.status === "tighter" || x.status === "looser"))) {
     box.append(h("div", { class: `banner ${g.status}`, role: "alert" },
       h("span", { class: "icon" }, g.status === "tighter" ? "▼" : "▲"),
       h("div", {},
         h("strong", {}, t("{tool} {window}窗口{state} {pct}%", { tool: TOOL_NAMES[g.tool], window: windowLabel(g),
-          state: stateName(g.status), pct: Math.abs((g.ratio - 1) * 100).toFixed(0) })),
+          state: stateName(g.status), pct: Math.abs((g.ratio - 1) * 100).toFixed(0) }),
+          g.declared ? null : h("span", { class: "tag", title: t("没有覆盖声明：估值里推测了其他来源的花费，结论仅供参考") }, t("推测"))),
         h("div", { class: "sub" }, t("折合 {model}：最近 {rn} 个窗口 {recent}，之前 {bn} 个窗口 {baseline}", {
           model: g.ref_model, rn: g.recent_n, recent: usd(g.recent_median), bn: g.baseline_n, baseline: usd(g.baseline_median) })))));
   }
@@ -344,11 +353,15 @@ function renderWindowRow(w, tNow = now()) {
       { when: clock(w.snapshot_at || tNow) }) },
       icon("coins"), t("本机 API 等价"), h("strong", {}, usd(w.cost_at_snapshot || 0)),
       estimable ? h("span", { class: "of", title: capTip }, t("/ 用满{range}", { range: capRange(w) })) : null),
+    w.estimate ? estimateFact(w.estimate) : null,
     later >= 0.01 ? h("span", { class: "fact muted", title: t("额度快照之后的新花费，等额度更新后再算进比例") },
       t("+{usd} 待额度更新", { usd: usd(later) })) : null,
     w.quality && !estimable
       ? h("span", { class: `fact quality ${w.quality}`, title: reasons.join("\n") }, qualityName(w.quality)) : null,
-    w.status ? h("span", { class: `fact state ${w.status}` }, stateName(w.status)) : null,
+    w.status ? h("span", { class: `fact state ${w.status}`,
+      title: w.eligible && !w.declared ? t("没有覆盖声明：估值里推测了其他来源的花费，结论仅供参考") : null },
+      stateName(w.status) + (w.eligible && !w.declared && (w.status === "tighter" || w.status === "looser")
+        ? t("（推测）") : "")) : null,
   ];
   const sources = w.sources ? sourceList(w.sources) : null;
   return h("div", { class: "win" },
@@ -364,6 +377,24 @@ function renderWindowRow(w, tNow = now()) {
     h("div", { class: "win-meta" }, h("span", {}, t("{span}后重置", { span: span(w.end - tNow) })), forecast,
       h("span", { class: "left" }, t("剩余 {pct}%", { pct: Math.max(0, 100 - pct).toFixed(0) }))),
     h("div", { class: "win-foot" }, facts), sources);
+}
+
+// Claude 窗口：总花费 = 确定（本机 Code）+ 推测（其他来源按同样比例折算）；5 小时窗口的 Code 占比由窗口期间的周分项变化拆出
+function estimateFact(e) {
+  const tip = [
+    t("确定：本机 Claude Code 日志按官方 API 价 {usd}（占已用部分的 {pct}%）", { usd: usd(e.local), pct: Math.round(e.code_pct) }),
+    e.basis === "window_delta"
+      ? t("推测：这段时间周额度涨了 {dw}%，其中非 Code 约 {dn} 个百分点，所以 Code 约占 {low}%～{high}%；其他来源按同样的额度/美元比例折算 ≈ {usd}",
+        { dw: Math.round(e.weekly_delta), dn: Math.max(0, e.noncode_delta).toFixed(1), low: Math.round(e.code_low),
+          high: Math.round(e.code_high), usd: usd(e.inferred) })
+      : t("推测：其他来源占 {pct}%，按同样的额度/美元比例折算 ≈ {usd}", { usd: usd(e.inferred), pct: Math.round(e.noncode_pct) }),
+    t("前提：Claude Code 只在这台电脑上用；网页、App、Cowork 每 1% 额度和 Code 等价"),
+    e.conflict_pct ? t("注意：约 {pct}% 的额度涨幅既没有本机日志、也不是非 Code 来源，Code 可能在别的设备上用过，估值偏低",
+      { pct: Math.round(e.conflict_pct) }) : null,
+  ].filter(Boolean).join("\n");
+  return h("span", { class: "fact", title: tip },
+    t("含推测 ≈ {usd}", { usd: usd(e.total) }) + (e.conflict_pct ? " ⚠" : ""),
+    h("span", { class: "of" }, t("/ 用满{range}", { range: t("约 {low}～{high}", { low: usd(e.cap_low), high: usd(e.cap_high) }) })));
 }
 
 // Claude 周窗口：已用部分来自哪些产品（官方分项，占已用部分的比例）
@@ -410,17 +441,16 @@ function renderMonitor(monitor) {
       h("div", { class: "card-head" },
         h("h3", {}, sprite(g.tool), `${TOOL_NAMES[g.tool]} · ${windowLabel(g)}`),
         h("span", { class: `stamp ${status}`, title: stateName(status) }, t(STAMPS[status] || status))));
-    // 没有满足估值条件的窗口：偏离仪和小图都是金额估值，一并不显示，只说明原因
-    if (g.ref_model && g.fit_basis !== "conditional") {
-      card.append(h("p", { class: "note" },
-        t("还没有满足估值条件的窗口，暂不显示容量估值。打开设置里的覆盖声明后，之后开始的窗口可以估值。")));
+    // 没有能估值的窗口：偏离仪和小图都是金额估值，一并不显示，只说明原因
+    if (!g.estimated_n) {
+      card.append(h("p", { class: "note" }, t("分析起点之后还没有能估值的窗口，暂不判断。")));
       const note = monitorNote(g, status);
       if (note) card.append(note);
       box.append(card);
       continue;
     }
-    if (g.ref_model) {
-      const value = g.recent_median ?? g.ref_cap;
+    if (g.recent_median != null) {
+      const value = g.recent_median;
       // 收紧是坏消息（红），放宽是好消息（绿），稳定不着色
       const deltaClass = { tighter: "delta bad", looser: "delta good" }[status] || "delta";
       card.append(
@@ -430,8 +460,13 @@ function renderMonitor(monitor) {
           g.ratio != null && status !== "model_changed"
             ? h("span", { class: deltaClass }, t("较之前 {pct}", { pct: pctText(g.ratio - 1) }))
             : null),
-        h("div", { class: "caption" }, t("全用 {model} 时一个窗口约值", { model: g.ref_model }) +
-          (g.recent_median == null ? "" : g.recent_n === 1 ? t("（最近 1 个窗口）") : t("（最近 {n} 个窗口中位）", { n: g.recent_n }))));
+        h("div", { class: "caption" }, t("一个窗口用满约值（API 价）") +
+          (g.recent_n === 1 ? t("（最近 1 个窗口）") : t("（最近 {n} 个窗口中位）", { n: g.recent_n }))));
+    }
+    // 不在覆盖声明下：估值含推测成分（其他来源按 Code 等价折算），结论只在这里显示，不弹通知
+    if (g.eligible && !g.declared && (status === "tighter" || status === "looser")) {
+      card.append(h("p", { class: "note" },
+        t("这个结论基于推测：其他来源（网页、App、Cowork）的消耗按和 Claude Code 等价折算。只在页面显示，不弹通知。")));
     }
     card.append(deviationGauge(g, status));
     const note = monitorNote(g, status);
@@ -1048,7 +1083,14 @@ const SETTING_FIELDS = [
   ["min_change_pct", "偏离超过多少才判为「被调」（%）", "number", "这是下限：你的数据本身波动大时会自动放宽"],
   ["model_overlap_pct", "前后共同在用的模型低于多少，算「换了模型」（%）", "number", "按最近窗口的花费占比算"],
   ["history_days", "首次启动导入多久以内的日志（天）", "number", "之后可以在「数据管理」里导入全部"],
+  ["analysis_since", "判断额度有没有被调，从什么时候开始算", "datetime", "之前开始的窗口照常显示，但不参与比较。留空 = 从正式观察开始"],
 ];
+// 本地时间 <-> datetime-local 输入框的值
+const toLocalInput = (ts) => {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+};
 const LANGUAGES = { auto: "跟随系统", zh: "中文", en: "English" };
 
 function renderSettings(s) {
@@ -1060,6 +1102,12 @@ function renderSettings(s) {
         h("option", { value: v, selected: s.values[key] === v ? "" : null }, t(text))));
     } else if (kind === "checkbox") {
       input = h("input", { type: "checkbox", name: key, checked: s.values[key] ? "" : null });
+    } else if (kind === "datetime") {
+      input = h("input", { type: "datetime-local", name: key, value: toLocalInput(s.values[key]),
+        placeholder: toLocalInput(s.default_since) });
+      form.append(h("label", { class: `field ${kind}` }, h("span", {}, t(label)), input,
+        h("small", {}, t(hint) + (s.default_since ? t("（{when}）", { when: when(s.default_since) }) : ""))));
+      continue;
     } else {
       const [lo, hi] = s.limits[key];
       input = h("input", { type: "number", name: key, value: s.values[key], min: lo, max: hi, step: 1 });
@@ -1116,7 +1164,8 @@ async function saveSettings(e) {
   const changes = {};
   for (const [key, , kind] of SETTING_FIELDS) {
     const el = form.elements[key];
-    changes[key] = kind === "checkbox" ? el.checked : kind === "number" ? Number(el.value) : el.value;
+    changes[key] = kind === "checkbox" ? el.checked : kind === "number" ? Number(el.value)
+      : kind === "datetime" ? (el.value ? Math.floor(new Date(el.value).getTime() / 1000) : 0) : el.value;
   }
   const r = await post("/api/settings", changes);
   setLang(r.values.language);

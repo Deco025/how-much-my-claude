@@ -282,6 +282,30 @@ class CalibrateTest(TempDB):
         self.assertAlmostEqual(group["ratio"], 0.6, delta=0.05)
         self.assertEqual((group["recent_n"], group["baseline_n"]), (4, 8))
 
+    def test_model_mix_shift_is_not_a_quota_change(self):
+        # 额度没变：a 每 $1 涨 10%，b 每 $1 涨 5%。之前以 a 为主、最近以 b 为主，
+        # 原始估值会从约 $11 涨到约 $17，折算成主力模型后应该不变
+        now = 50 * 86400
+
+        def mixed(conn, name, start, share_a):
+            reset, pct = start + 18000, 0.0
+            for i in range(10):
+                ts = start + 60 * (i + 1)
+                ca, cb = 0.5 * share_a, 0.5 * (1 - share_a)
+                self.add(conn, f"{name}-{i}a", "codex", ts, "a", ca, ("codex", "five_hour", reset))
+                self.add(conn, f"{name}-{i}b", "codex", ts, "b", cb, ("codex", "five_hour", reset))
+                pct += 10 * ca + 5 * cb
+                self.snap(conn, "codex", "codex", "five_hour", ts, pct, reset, 18000)
+
+        with db.writer() as conn:
+            for i in range(8):
+                mixed(conn, f"old{i}", now - (20 - 2 * i) * 86400, 0.8 - 0.02 * i)
+            for i in range(4):
+                mixed(conn, f"new{i}", now - (60 - 12 * i) * 3600, 0.3 + 0.02 * i)
+        group = self.analyze("codex", now)["groups"][0]
+        self.assertEqual(group["status"], "stable")
+        self.assertAlmostEqual(group["ratio"], 1.0, delta=0.05)
+
     def test_stable_when_unchanged(self):
         now = 50 * 86400
         with db.writer() as conn:
@@ -436,7 +460,7 @@ class ReviewFixesTest(TempDB):
         svc = Service(notify_desktop=False)
         group = {"status": "tighter", "scope": "codex", "window": "five_hour", "plan_type": "plus", "ratio": 0.6,
                  "recent_n": 4, "baseline_n": 8, "ref_model": "a", "recent_median": 6.0, "baseline_median": 10.0,
-                 "eligible": True, "analysis_version": calibrate.ANALYSIS_VERSION}
+                 "eligible": True, "declared": True, "analysis_version": calibrate.ANALYSIS_VERSION}
         analysis = {"at": 1000.0, "tools": {"codex": {"groups": [group]}}}
         self.assertEqual(len(svc._record_alerts(analysis)), 1)
         self.assertEqual(svc._record_alerts({**analysis, "at": 2000.0}), [])
@@ -452,7 +476,9 @@ class ReviewFixesTest(TempDB):
         base = {"status": "tighter", "scope": "codex", "window": "five_hour", "plan_type": "plus", "ratio": 0.6,
                 "recent_n": 4, "baseline_n": 8, "ref_model": "a", "recent_median": 6.0, "baseline_median": 10.0}
         for group in ({**base}, {**base, "eligible": False, "analysis_version": calibrate.ANALYSIS_VERSION},
-                      {**base, "eligible": True, "analysis_version": 1}):
+                      {**base, "eligible": True, "declared": True, "analysis_version": 1},
+                      # 有资格但含推测成分（不在声明下）：只在页面显示，不写告警
+                      {**base, "eligible": True, "declared": False, "analysis_version": calibrate.ANALYSIS_VERSION}):
             self.assertEqual(svc._record_alerts({"at": 1000.0, "tools": {"codex": {"groups": [group]}}}), [])
         with db.reader() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM alert").fetchone()[0], 0)
@@ -768,7 +794,8 @@ class AcceptanceTest(TempDB):
         return [r["code"] for r in w["reasons"]]
 
     # 默认状态：没有声明
-    def test_default_no_claim_hides_capacity_everywhere(self):
+    def test_default_no_claim_hides_fit_capacity_but_keeps_estimate(self):
+        # 没有声明：拟合出的容量（cap、ref_cap）不给；趋势用的是窗口自己的估值（确定 + 推测），照常给
         self.week()
         with db.reader() as conn:
             result = calibrate.analyze(conn, "claude", now=self.T + 50_000)
@@ -776,13 +803,14 @@ class AcceptanceTest(TempDB):
         self.assertEqual(w["quality"], "unconfirmed")
         self.assertIn("no_claim", self.codes(w))
         self.assertIsNone(w["cap"])
-        self.assertIsNone(w["value"])
+        self.assertIsNotNone(w["estimate"])
+        self.assertIsNotNone(w["value"])
         for g in result["groups"]:
             self.assertFalse(g["eligible"])
+            self.assertFalse(g["declared"])
             self.assertIsNone(g["ref_cap"])
-            self.assertTrue(all(p["value"] is None for p in g["trend"]))
         pub = calibrate.public(w)
-        for k in ("cap", "cap_low", "cap_high", "value"):
+        for k in ("cap", "cap_low", "cap_high"):
             self.assertIsNone(pub.get(k))
 
     # 声明边界
@@ -846,6 +874,148 @@ class AcceptanceTest(TempDB):
         self.assertEqual(w["quality"], "conditional")
         self.assertAlmostEqual(w["bias_pct"], 3)
         self.assertAlmostEqual(w["cap"], 200.0)
+
+    def test_estimate_splits_known_and_inferred_without_claim(self):
+        # 未声明、Code 80%：确定 $120，推测 $30，总 $150；已用 60% → 用满约 $250
+        self.week(claude_code=80, chat=20)
+        w = self.window()
+        self.assertIsNone(w["cap"])
+        e = w["estimate"]
+        self.assertAlmostEqual(e["local"], 120.0)
+        self.assertAlmostEqual(e["inferred"], 30.0)
+        self.assertAlmostEqual(e["cap"], 250.0)
+        self.assertLess(e["cap_low"], 250.0)
+        self.assertGreater(e["cap_high"], 250.0)
+
+    def test_estimate_skipped_when_code_share_tiny(self):
+        self.week(claude_code=10, chat=90)
+        self.assertIsNone(self.window()["estimate"])
+
+    def five_hour(self, start, cost, pct5, weekly, breakdowns):
+        """周窗口从 T 开始；5h 窗口 [start, start+5h) 花 cost 用到 pct5。weekly: [(ts, 周%)]；breakdowns: [(ts, {key: %})]。"""
+        T = self.T
+        with db.writer() as conn:
+            self.add(conn, "u5", "claude", start + 600, "claude-opus-5-5", cost)
+            for ts, pct in weekly:
+                self.snap(conn, "claude", "all", "seven_day", ts, pct, T + 604800, 604800)
+            self.snap(conn, "claude", "all", "five_hour", start + 60, 0.0, start + 18000, 18000)
+            self.snap(conn, "claude", "all", "five_hour", start + 4 * 3600, pct5, start + 18000, 18000)
+            for ts, pcts in breakdowns:
+                self.breakdown(conn, ts, T, **pcts)
+        with db.reader() as conn:
+            return [w for w in calibrate.analyze(conn, "claude", now=start + 20000)["windows"]
+                    if w["window"] == "five_hour"][0]
+
+    def test_five_hour_split_from_weekly_breakdown_change(self):
+        # 窗口期间周% 20→30；非 Code 百分点 20×10%=2 → 30×20%=6，涨 4，所以窗口里 Code 占 60%
+        s = self.T + 3600
+        w = self.five_hour(s, 24.0, 50.0, [(s, 20.0), (s + 4 * 3600, 30.0)],
+                           [(s, {"claude_code": 90, "chat": 10}), (s + 4 * 3600, {"claude_code": 80, "chat": 20})])
+        e = w["estimate"]
+        self.assertEqual(e["basis"], "window_delta")
+        self.assertAlmostEqual(e["code_pct"], 60.0)
+        self.assertAlmostEqual(e["total"], 40.0)    # $24 / 60%
+        self.assertAlmostEqual(e["cap"], 80.0)      # $40 / 50%
+        self.assertLess(e["cap_low"], 80.0)
+        self.assertGreater(e["cap_high"], 80.0)
+
+    def test_five_hour_pure_code_window(self):
+        s = self.T + 3600
+        w = self.five_hour(s, 24.0, 50.0, [(s, 20.0), (s + 4 * 3600, 30.0)],
+                           [(s, {"claude_code": 90, "chat": 10}), (s + 4 * 3600, {"claude_code": 93, "chat": 7})])
+        # 非 Code 百分点 20×10%=2 → 30×7%=2.1，只涨 0.1：Code 占 99%，取整误差内和纯 Code 一样
+        self.assertAlmostEqual(w["estimate"]["code_pct"], 99.0)
+        self.assertGreaterEqual(w["estimate"]["code_high"], 99.9)
+        self.assertAlmostEqual(w["estimate"]["cap"], 48.0, delta=0.6)
+
+    def test_five_hour_no_split_without_nearby_breakdown(self):
+        # 窗口开始前和窗口内都没有分项（只有窗口结束后很久的一组）：拆不了
+        s = self.T + 3600
+        w = self.five_hour(s, 24.0, 50.0, [(s, 20.0), (s + 4 * 3600, 30.0), (s + 30000, 31.0)],
+                           [(s + 30000, {"claude_code": 80, "chat": 20})])
+        self.assertIsNone(w["estimate"])
+
+    def test_five_hour_no_split_when_weekly_barely_moves(self):
+        s = self.T + 3600
+        w = self.five_hour(s, 2.0, 8.0, [(s, 20.0), (s + 4 * 3600, 21.0)],
+                           [(s, {"claude_code": 90, "chat": 10}), (s + 4 * 3600, {"claude_code": 90, "chat": 10})])
+        self.assertIsNone(w["estimate"])
+
+    @staticmethod
+    def sample(t, week, wpct, noncode):
+        return {"t": t, "week": week, "w": wpct, "pp": noncode / 100 * wpct, "err": 0.0}
+
+    def test_split_across_weekly_reset(self):
+        # 旧周 50→54（非 Code 0→+2 点），新周从 0 到 6（非 Code 0）：周额度共涨 10，非 Code 2 → Code 80%
+        w = {"start": 1000, "last_seen": 1000 + 4 * 3600, "points": [{"ts": 1000, "pct": 0.0}]}
+        samples = [self.sample(900, 0, 50, 0), self.sample(5000, 0, 54, 100 * 2 / 54),
+                   self.sample(1000 + 4 * 3600, 1, 6, 0)]
+        sp = calibrate._window_split(w, samples)
+        self.assertEqual(sp["weekly_delta"], 10)
+        self.assertAlmostEqual(sp["code"], 80.0)
+        self.assertLess(sp["code_low"], 80.0)
+
+    def test_split_starts_inside_window_only_if_little_used(self):
+        # 窗口开始前没有分项：用窗口内第一组当起点，那时 5h 才用了 2% 才行
+        samples = [self.sample(2000, 0, 20, 10), self.sample(1000 + 4 * 3600, 0, 30, 10)]
+        w = {"start": 1000, "last_seen": 1000 + 4 * 3600, "points": [{"ts": 1500, "pct": 2.0}]}
+        self.assertAlmostEqual(calibrate._window_split(w, samples)["code"], 90.0)
+        w["points"] = [{"ts": 1500, "pct": 30.0}]
+        self.assertIsNone(calibrate._window_split(w, samples))
+
+    def test_breakdown_paired_with_same_poll_snapshot(self):
+        # 服务器的 as_of 比本机快照早 5 秒：应配上这次查询的周% 30，而不是上一次的 20
+        week = {"start": 0, "end": 604800, "points": [{"ts": 1000, "pct": 20.0}, {"ts": 2005, "pct": 30.0}]}
+        ctx = {"breakdowns": [{"as_of": 2000, "last_as_of": 2000, "window_start": 0, "invalid": False,
+                               "noncode": 10.0, "noncode_err": 0.0}]}
+        [smp] = calibrate._weekly_samples([week], ctx)
+        self.assertEqual(smp["w"], 30.0)
+
+    def test_claude_estimate_not_blocked_by_external_rise(self):
+        # Claude 有来源分项：没有本机日志的涨幅本来就该是网页/App/Cowork，不按「疑似未记录」拦
+        base = {"supported": True, "window": "seven_day", "used_percent": 60.0, "cost_at_snapshot": 30.0,
+                "external_pct": 20.0, "reasons": [{"code": "suspect_unrecorded", "pct": 20.0}]}
+        w = dict(base, sources={"code": 70.0, "known": 30.0, "unknown": 0.0}, reasons=list(base["reasons"]))
+        calibrate._set_estimate(w)
+        self.assertIsNotNone(w["estimate"])
+        # Codex 假设全在本机，涨幅没有日志就说明有漏记，照拦
+        w = dict(base, tool="codex", sources=None, reasons=list(base["reasons"]))
+        calibrate._set_estimate(w)
+        self.assertIsNone(w["estimate"])
+        self.assertEqual(w["_est_why"], "suspect_unrecorded")
+
+    def test_estimate_flags_unexplained_external_rise(self):
+        # Code 占 99%，但窗口里有 14% 的涨幅没有本机日志：前提可能不成立，标出来
+        w = {"supported": True, "window": "five_hour", "sources": None, "reasons": [], "used_percent": 100.0,
+             "cost_at_snapshot": 30.0, "external_pct": 14.0,
+             "_split": {"code": 99.0, "code_low": 97.0, "code_high": 100.0, "weekly_delta": 13, "noncode_delta": 0.1}}
+        calibrate._set_estimate(w)
+        self.assertAlmostEqual(w["estimate"]["conflict_pct"], 11.0)
+        w["external_pct"] = 2.0
+        calibrate._set_estimate(w)
+        self.assertEqual(w["estimate"]["conflict_pct"], 0.0)
+
+    def test_service_rebuilds_breakdowns_once(self):
+        from quotalens.service import Service
+        with mock.patch.object(claude_quota, "backfill_breakdowns", return_value=0) as bf:
+            Service(notify_desktop=False)
+            Service(notify_desktop=False)
+            Service(notify_desktop=False, demo=True)
+        bf.assert_called_once()
+
+    def test_backfill_rebuild_recovers_history_before_live_rows(self):
+        def body(code, chat):
+            return {"seven_day": {"utilization": 30, "resets_at": "2026-10-09T00:00:00Z"},
+                    claude_quota.BREAKDOWN_KEY: {"as_of": None, "window_started_at": "2026-10-02T00:00:00Z",
+                                                 "rows": [{"key": "claude_code", "display_name": "Code", "percent": code},
+                                                          {"key": "chat", "display_name": "Chats", "percent": chat}]}}
+        with db.writer() as conn:
+            db.archive_response(conn, "claude", 1000.0, body(90, 10))
+            db.archive_response(conn, "claude", 2000.0, body(80, 20))
+            claude_quota.store_breakdown(conn, claude_quota.parse_breakdown(body(80, 20)), 2000.0)
+            self.assertEqual(claude_quota.backfill_breakdowns(conn), 0)   # 只追加：更早的补不进来
+            self.assertEqual(claude_quota.backfill_breakdowns(conn, rebuild=True), 2)
+            self.assertEqual([b["as_of"] for b in db.breakdowns(conn, "claude")], [1000.0, 2000.0])
 
     def test_combined_noncode_share_blocks(self):
         # 单看 Chats 3%、未知 3% 都不到 5%，但非 Code 合计 6% 到了
@@ -916,6 +1086,67 @@ class AcceptanceTest(TempDB):
         with db.reader() as conn:
             row = conn.execute("SELECT analysis_version FROM alert").fetchone()
         self.assertEqual(row[0], 1)
+
+
+class EstimateTrendTest(TempDB):
+    """趋势用每个窗口的估值：不要求覆盖声明；分析起点之前的窗口不参与。"""
+    add, snap, codex_window, analyze = CalibrateTest.add, CalibrateTest.snap, CalibrateTest.codex_window, None
+
+    def run_analyze(self, now, since=0):
+        with db.reader() as conn:
+            return calibrate.analyze(conn, "codex", now=now, params={"since": since})
+
+    def seed(self, now):
+        with db.writer() as conn:
+            for i in range(8):   # 之前 3 周：窗口值 $10
+                self.codex_window(conn, f"old{i}", now - (20 - 2 * i) * 86400, [(0.5, 5)] * 10)
+            for i in range(4):   # 最近 3 天：窗口值 $6
+                self.codex_window(conn, f"new{i}", now - (60 - 12 * i) * 3600, [(0.3, 5)] * 10)
+
+    def test_codex_judged_without_claim_but_not_declared(self):
+        now = 50 * 86400
+        self.seed(now)
+        result = self.run_analyze(now)
+        w = result["windows"][-1]
+        self.assertEqual(w["estimate"]["basis"], "local_only")
+        self.assertAlmostEqual(w["estimate"]["cap"], 6.0, delta=0.01)
+        self.assertIsNone(w["cap"])   # 拟合容量仍然只在声明下给
+        g = result["groups"][0]
+        self.assertEqual(g["status"], "tighter")
+        self.assertAlmostEqual(g["ratio"], 0.6, delta=0.05)
+        self.assertTrue(g["eligible"])
+        self.assertFalse(g["declared"])   # 含推测前提：页面显示，不写告警
+
+    def test_since_drops_older_windows(self):
+        now = 50 * 86400
+        self.seed(now)
+        # 起点放在旧窗口之后：没有基线，不判断
+        g = self.run_analyze(now, since=now - 4 * 86400)["groups"][0]
+        self.assertEqual(g["status"], "insufficient")
+        self.assertEqual(g["baseline_n"], 0)
+        self.assertEqual(g["since"], now - 4 * 86400)
+        trend = [p for p in g["trend"] if p["in_trend"]]
+        self.assertTrue(trend and all(p["start"] >= now - 4 * 86400 for p in trend))
+        # 起点之前的窗口照样有估值，只是不参与比较
+        windows = self.run_analyze(now, since=now - 4 * 86400)["windows"]
+        self.assertTrue(all(w["estimate"] for w in windows))
+
+    def test_blocked_reasons_come_from_missing_estimates(self):
+        now = 50 * 86400
+        with db.writer() as conn:
+            for i in range(8):   # 之前：干净
+                self.codex_window(conn, f"old{i}", now - (20 - 2 * i) * 86400, [(0.5, 5)] * 10)
+            # 最近：每个窗口都有一大段没有本机日志的涨幅，疑似在别处用过，不给估值
+            for i in range(4):
+                self.codex_window(conn, f"new{i}", now - (60 - 12 * i) * 3600, [(0.5, 5)] * 4 + [(0, 30)])
+        result = self.run_analyze(now)
+        recent = [w for w in result["windows"] if w["start"] >= now - 4 * 86400]
+        self.assertTrue(recent and all(w["estimate"] is None for w in recent))
+        self.assertTrue(all(w["_est_why"] == "suspect_unrecorded" for w in recent))
+        g = result["groups"][0]
+        self.assertEqual(g["status"], "not_eligible")
+        self.assertIn("suspect_unrecorded", g["blocked"])
+        self.assertNotIn("no_claim", g["blocked"])
 
 
 if __name__ == "__main__":
